@@ -41,7 +41,7 @@ import os
 import random
 import statistics
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # The grader's -P leaves /bot off sys.path: put it back first.
@@ -283,7 +283,6 @@ def simulate_refresh_times(rng: random.Random, gap_model, t_last: datetime,
     times = []
     t = t_checkpoint
     gap = _draw_gap(rng, gap_model, age)
-    from datetime import timedelta
     while True:
         t = t + timedelta(hours=gap)
         times.append(t)
@@ -543,8 +542,7 @@ def fit_trophy_curves(case: dict, segments: list[dict]):
         med_k = sorted(b[1] for b in fitted)[len(fitted) // 2]
         med_j = sorted(b[2] for b in fitted)[len(fitted) // 2]
     else:
-        med_a, med_k, med_j = 0.05, 0.05, 0.01
-    # Transformed params + SEs. Unidentified trophies take the population
+        med_a, med_k, med_j = 0.05, 0.05, 0.01    # Transformed params + SEs. Unidentified trophies take the population
     # medians with a huge SE, so shrinkage pulls them fully to the prior.
     us, vs, ws, seus, sevs, sews = [], [], [], [], [], []
     for b in base:
@@ -663,9 +661,285 @@ def fit_trophy_curves(case: dict, segments: list[dict]):
             sum((v - m_sm) ** 2 for v in seg_means) / len(seg_means))))
     else:
         sigma_g = 0.2
+    # Posterior standard errors for the scenario draws: the shrunk estimate
+    # is the posterior mean, and 1/se_post^2 = 1/se^2 + 1/tau^2.
+    post_u = [math.sqrt((se * se * tau_u) / (se * se + tau_u)) for se in seus]
+    post_v = [math.sqrt((se * se * tau_v) / (se * se + tau_v)) for se in sevs]
+    post_w = [math.sqrt((se * se * tau_w) / (se * se + tau_w)) for se in sews]
     return {"r0": r0s, "base": base, "variants": variants,
             "rho": rho, "sigma_res": sigma_res, "sigma_g": sigma_g,
-            "res_last": res_last}
+            "res_last": res_last,
+            "post_se_u": post_u, "post_se_v": post_v, "post_se_w": post_w}
+
+
+# ---------------------------------------------------------------- Stage 3 ---
+# Joint predictive scenarios.
+#
+# One scenario draws, in a fixed order (so variants sharing a seed share
+# the skeleton — common random numbers, which makes the M0/M1/M2 comparison
+# low-variance):
+#   (i)   a refresh path from the fitted renewal process -> t* (last refresh
+#         at or before the target; shared by all trophies and by P);
+#   (ii)  adoption parameters (a, b) from the LS normal approximation,
+#         with the daily-growth cap -> P at every future refresh;
+#   (iii) a SHARED progression-speed shock g (multiplies all k_i);
+#   (iv)  per-trophy parameters (a_i, k_i, j_i) from their approximate
+#         posteriors (normal on transformed scales), independent
+#         CONDITIONAL on g;
+#   (v)   per-trophy residual draws with the fitted decay.
+# The cohort recursion then runs from the fitted earner state at the last
+# observed segment along the scenario's refresh path, and the scenario rate
+# is R_i = 100 * E_i / P(t*). The P(t*) does NOT cancel: the joiner terms
+# and the incumbent evolution both depend on the player path. Quantiles are
+# the empirical tau-quantiles of the scenario rates (rounded to 2 decimals,
+# as the page prints them).
+
+def build_context(case: dict, segments: list[dict]) -> dict:
+    """Fit everything the scenarios need, once, from the case's history."""
+    t_release = parse_time(case["game"]["release_date"])
+    t_checkpoint = parse_time(case["at"])
+    t_target = parse_time(case["target"])
+    adoption = fit_adoption(segments, t_release)
+    gaps = fit_gaps(segments)
+    trophies = fit_trophy_curves(case, segments)
+    horizon_days = (t_target - t_checkpoint).total_seconds() / 86400.0
+    return {"case": case, "segments": segments, "t_release": t_release,
+            "t_checkpoint": t_checkpoint, "t_target": t_target,
+            "adoption": adoption, "gaps": gaps, "trophies": trophies,
+            "horizon_days": horizon_days}
+
+
+def _draw_adoption(rng: random.Random, fit: dict, tau_target: float):
+    """(a, b) from the LS normal approximation (Cholesky), b capped at the
+    largest observed daily growth and floored at 0 (players do not shrink
+    in launch week). Returns (a, b_eff)."""
+    a, b = fit["a"], fit["b"]
+    va, vb, cov = fit["var_a"], fit["var_b"], fit["cov_ab"]
+    if va > 1e-12 and vb > 1e-12:
+        z1 = rng.gauss(0.0, 1.0)
+        z2 = rng.gauss(0.0, 1.0)
+        sa = math.sqrt(va)
+        a_d = a + sa * z1
+        b_d = b + (cov / sa) * z1 + math.sqrt(max(vb - cov * cov / va, 0.0)) * z2
+    else:
+        a_d, b_d = a, b
+    b_cap = capped_b({"a": a_d, "b": b_d, "max_daily_growth": fit["max_daily_growth"]},
+                     tau_target)
+    return a_d, min(max(b_d, 0.05), b_cap) if b_cap > 0.05 else max(b_d, 0.05)
+
+
+def _scenario_rates(ctx: dict, variant: str, rng: random.Random, E_last: list[float],
+                    adoption_scale: float = 1.0, gap_scale: float = 1.0,
+                    force_no_refresh: bool = False) -> list[float]:
+    """One joint scenario -> the 55 scenario rates (percent, 2-decimal)."""
+    case = ctx["case"]
+    segments = ctx["segments"]
+    trophies = ctx["trophies"]
+    n_tr = len(case["trophies"])
+    t_checkpoint = ctx["t_checkpoint"]
+    t_target = ctx["t_target"]
+    t_release = ctx["t_release"]
+    # (i) Refresh path -> t* and the future (time, P) breakpoints.
+    gap_model = ctx["gaps"]
+    if gap_scale != 1.0 and gap_model[0] == "lognormal":
+        _, ml, sl = gap_model
+        gap_model = ("lognormal", ml + math.log(gap_scale), sl)
+    elif gap_scale != 1.0:
+        gap_model = ("empirical", [g * gap_scale for g in gap_model[1]])
+    t_last = segments[-1]["start"]
+    if force_no_refresh:
+        refreshes = []
+    else:
+        refreshes = simulate_refresh_times(rng, gap_model, t_last,
+                                           t_checkpoint, t_target)
+    t_star = t_last
+    for t in refreshes:
+        if t <= t_target:
+            t_star = t
+    # (ii) Adoption draw -> P at every future refresh.
+    tau_target = hours_between(t_release, t_target)
+    a_ad, b_ad = _draw_adoption(rng, ctx["adoption"], tau_target)
+    b_ad = b_ad * adoption_scale
+    future_P = []
+    for t in refreshes:
+        tau = hours_between(t_release, t)
+        future_P.append(math.exp(a_ad + b_ad * math.log1p(max(tau, -0.9))))
+    # Breakpoints: observed segments, then future refreshes up to t*.
+    points = [(seg["start"], seg["P"]) for seg in segments]
+    for t, p in zip(refreshes, future_P):
+        if t <= t_star:
+            # P is monotone by construction (b > 0); guard anyway.
+            points.append((t, max(p, points[-1][1])))
+    # (iii) Shared speed shock.
+    g = math.exp(rng.gauss(0.0, trophies["sigma_g"])) if trophies["sigma_g"] > 0 else 1.0
+    # (iv) Per-trophy parameters from their approximate posteriors.
+    params = trophies["variants"][variant]
+    res_last = trophies["res_last"]
+    rho = trophies["rho"]
+    h = ctx["horizon_days"]
+    decay = rho ** h if rho > 0 else 0.0
+    noise_sd = trophies["sigma_res"] * math.sqrt(max(1.0 - rho ** (2.0 * h), 0.0))
+    out = []
+    for i in range(n_tr):
+        a, k, j = params[i]
+        # Posterior draws on transformed scales.
+        lk = math.log(max(k, 1e-6)) + rng.gauss(0.0, trophies["post_se_u"][i])
+        la = _logit_raw(a) + rng.gauss(0.0, trophies["post_se_v"][i])
+        lj = _logit_raw(max(j, 0.0001)) + rng.gauss(0.0, trophies["post_se_w"][i])
+        k_d = min(max(math.exp(lk) * g, 1e-4), 50.0)
+        a_d = _logistic_pct(la)
+        j_d = _logistic_pct(lj)
+        # Cohort recursion from the fitted state along the scenario path.
+        E = E_last[i]
+        P_now = segments[-1]["P"]
+        for m in range(len(points) - 1):
+            t0p, P0p = points[m]
+            t1p, P1p = points[m + 1]
+            dt = hours_between(t0p, t1p)
+            if dt <= 0:
+                continue
+            # Only the FUTURE part (after the last observed segment) moves;
+            # the past is already in E_last. Start from the last segment.
+            if t1p <= segments[-1]["start"]:
+                continue
+            # Interval [t0p, t1p] at P0p, then the jump to P1p.
+            E = (a_d / 100.0) * P0p + (E - (a_d / 100.0) * P0p) * math.exp(-k_d * dt)
+            E = E + (j_d / 100.0) * (P1p - P0p)
+            P_now = P1p
+        P_star = P_now if P_now > 0 else segments[-1]["P"]
+        R = 100.0 * E / P_star if P_star > 0 else 0.0
+        # (v) Residual: decayed last residual + noise, on the logit scale.
+        shift = decay * (res_last[i] if i < len(res_last) else 0.0)
+        if noise_sd > 0:
+            shift += rng.gauss(0.0, noise_sd)
+        R = logistic(logit(R) + shift)
+        out.append(round2_half_up(min(max(R, 0.0), 100.0)))
+    return out
+
+
+def _quantile(sorted_vals, tau: float) -> float:
+    """Empirical quantile, linear interpolation on the sorted list."""
+    n = len(sorted_vals)
+    if n == 1:
+        return sorted_vals[0]
+    pos = tau * (n - 1)
+    lo = int(math.floor(pos))
+    hi = min(lo + 1, n - 1)
+    frac = pos - lo
+    return sorted_vals[lo] * (1.0 - frac) + sorted_vals[hi] * frac
+
+
+def run_scenarios(ctx: dict, variant: str, n_scen: int, seed: int,
+                  adoption_scale: float = 1.0, gap_scale: float = 1.0,
+                  force_no_refresh: bool = False) -> list[list[float]]:
+    """n_scen joint scenarios -> per-trophy lists of scenario rates."""
+    n_tr = len(ctx["case"]["trophies"])
+    segments = ctx["segments"]
+    trophies = ctx["trophies"]
+    params = trophies["variants"][variant]
+    r0s = trophies["r0"]
+    # Fitted earner state at the last observed segment (scenario-independent).
+    E_last = []
+    for i in range(n_tr):
+        a, k, j = params[i]
+        rates = _recursion_rates(a, k, j, r0s[i], segments)
+        E_last.append(segments[-1]["P"] * rates[-1] / 100.0)
+    cols = [[] for _ in range(n_tr)]
+    for s in range(n_scen):
+        rng = random.Random(seed + s)
+        rates = _scenario_rates(ctx, variant, rng, E_last,
+                                adoption_scale=adoption_scale,
+                                gap_scale=gap_scale,
+                                force_no_refresh=force_no_refresh)
+        for i, r in enumerate(rates):
+            cols[i].append(r)
+    return cols
+
+
+def quantiles_from_scenarios(ctx: dict, cols: list[list[float]]) -> dict:
+    rows = []
+    for i, trophy in enumerate(ctx["case"]["trophies"]):
+        vals = sorted(cols[i])
+        rows.append({"id": trophy["id"],
+                     "q": [round4(_quantile(vals, tau)) for tau in LEVELS]})
+    return {"trophies": rows}
+
+
+def median_forecast(ctx: dict, variant: str) -> list[float]:
+    """Deterministic median path (no Monte Carlo): median refresh gaps,
+    median adoption, median parameters, g = 1, decayed residual only.
+    Used for the cheap Leg A variant comparison."""
+    case = ctx["case"]
+    segments = ctx["segments"]
+    trophies = ctx["trophies"]
+    n_tr = len(case["trophies"])
+    t_checkpoint = ctx["t_checkpoint"]
+    t_target = ctx["t_target"]
+    t_release = ctx["t_release"]
+    t_last = segments[-1]["start"]
+    # Median refresh path.
+    gap_model = ctx["gaps"]
+    age = hours_between(t_last, t_checkpoint)
+    times = []
+    t = t_checkpoint
+    if gap_model[0] == "lognormal":
+        _, ml, sl = gap_model
+        nd = statistics.NormalDist()
+        p_age = nd.cdf((math.log(age) - ml) / sl) if age > 0 else 0.0
+        med_first = math.exp(ml + sl * nd.inv_cdf(min(max((1.0 + p_age) / 2.0, 1e-9), 1 - 1e-9)))
+        med_gap = math.exp(ml)
+        gap = med_first
+    else:
+        gaps = sorted(gap_model[1]) if gap_model[1] else [24.0]
+        above = [g for g in gaps if g > age]
+        gap = above[len(above) // 2] if above else max(gaps) * 1.5
+        med_gap = gaps[len(gaps) // 2]
+    while True:
+        t = t + timedelta(hours=gap)
+        times.append(t)
+        if t >= t_target or len(times) > 1000:
+            break
+        gap = med_gap
+    t_star = t_last
+    for tt in times:
+        if tt <= t_target:
+            t_star = tt
+    # Median adoption.
+    fit = ctx["adoption"]
+    tau_target = hours_between(t_release, t_target)
+    b_eff = capped_b(fit, tau_target)
+    points = [(seg["start"], seg["P"]) for seg in segments]
+    for tt in times:
+        if tt <= t_star:
+            tau = hours_between(t_release, tt)
+            p = math.exp(fit["a"] + b_eff * math.log1p(max(tau, -0.9)))
+            points.append((tt, max(p, points[-1][1])))
+    params = trophies["variants"][variant]
+    r0s = trophies["r0"]
+    res_last = trophies["res_last"]
+    rho = trophies["rho"]
+    h = ctx["horizon_days"]
+    decay = rho ** h if rho > 0 else 0.0
+    out = []
+    for i in range(n_tr):
+        a, k, j = params[i]
+        rates = _recursion_rates(a, k, j, r0s[i], segments)
+        E = segments[-1]["P"] * rates[-1] / 100.0
+        P_now = segments[-1]["P"]
+        for m in range(len(points) - 1):
+            t0p, P0p = points[m]
+            t1p, P1p = points[m + 1]
+            dt = hours_between(t0p, t1p)
+            if dt <= 0 or t1p <= segments[-1]["start"]:
+                continue
+            E = (a / 100.0) * P0p + (E - (a / 100.0) * P0p) * math.exp(-k * dt)
+            E = E + (j / 100.0) * (P1p - P0p)
+            P_now = P1p
+        R = 100.0 * E / P_now if P_now > 0 else 0.0
+        shift = decay * (res_last[i] if i < len(res_last) else 0.0)
+        R = logistic(logit(R) + shift)
+        out.append(round2_half_up(min(max(R, 0.0), 100.0)))
+    return out
 
 
 # ------------------------------------------------------- starter (fallback) ---
@@ -708,8 +982,11 @@ def forecast_case(case: dict, name: str) -> dict:
 
 
 def model_forecast(case: dict, segments: list[dict], name: str) -> dict:
-    # Stages 2-4 land in the next commits; until then the starter form.
-    return starter_forecast(case)
+    # Stage 3 lands here; Stage 4 (variant selection, calibration, stress
+    # floor) wraps this call. Until then: joint scenarios, M0, uncalibrated.
+    ctx = build_context(case, segments)
+    cols = run_scenarios(ctx, "M0", N_FINAL, SEED)
+    return quantiles_from_scenarios(ctx, cols)
 
 
 def main() -> None:

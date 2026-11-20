@@ -94,53 +94,9 @@ def make_synthetic_case(segments, at, horizon_minutes, target, trophies):
             "trophies": trophies, "history": hist, "notes": "synthetic"}
 
 
-def test_stage01():
-    """Stage 0-1 on a synthetic multi-segment history (hand-built anchors)."""
-    print("== Stage 0-1: segmentation + adoption + renewal (synthetic) ==")
-    p00 = load_case(KIT / "input" / "p00.in")
-    trophies = p00["trophies"]
-    base = p00["history"][-1]["rates"]
-    t0 = datetime(2026, 11, 18, 23, 50, tzinfo=timezone.utc)
-    # Four segments: P explodes, slow trophies dilute, fast ones rise.
-    segs = []
-    for k, (dh, P, mult_slow, fast) in enumerate([
-            (0, 638, 1.0, 1.0),
-            (5, 3868, 0.17, 1.3),
-            (12, 20000, 0.05, 2.0),
-            (30, 90000, 0.015, 3.0)]):
-        rates = []
-        for i, r in enumerate(base):
-            if r >= 99.99:
-                rates.append(100.0)
-            elif i in (2, 19):  # fast trophies (id 3, id 20) rise
-                rates.append(round(min(99.99, r * fast), 2))
-            else:
-                rates.append(round(max(0.01, r * mult_slow), 2))
-        segs.append((t0 + timedelta(hours=dh), P, rates))
-    at = t0 + timedelta(hours=36)
-    case = make_synthetic_case(segs, at, 90, at + timedelta(minutes=90), trophies)
-    segments = M.segment_history(case)
-    print(f"  reads: {len(case['history'])}, segments detected: {len(segments)} (want 4)")
-    assert len(segments) == 4, "segmentation failed"
-    for s in segments:
-        print(f"    {s['start']} P={s['P']} rates[0,2,19]={s['rates'][0]},{s['rates'][2]},{s['rates'][19]}")
-    t_rel = M.parse_time(case["game"]["release_date"])
-    fit = M.fit_adoption(segments, t_rel)
-    print(f"  adoption: a={fit['a']:.3f} b={fit['b']:.3f} sigma={fit['sigma']:.3f} "
-          f"max_daily_growth={fit['max_daily_growth']:.2f}")
-    gaps = M.fit_gaps(segments)
-    print(f"  gaps model: {gaps}")
-    rng = random.Random(M.SEED)
-    times = M.simulate_refresh_times(rng, gaps, segments[-1]["start"], at,
-                                     at + timedelta(days=4.5))
-    print(f"  simulated refreshes to target+4.5d: {len(times)} (first {times[0] if times else None})")
-    print("  Stage 0-1 OK")
-    return True
-
-
-def test_stage02():
-    """Stage 2: trophy curves + M0/M1/M2 shrinkage on the synthetic history."""
-    print("== Stage 2: trophy curves + shrinkage ==")
+def _synthetic_case():
+    """The shared synthetic 4-segment history (P explodes, slow trophies
+    dilute, fast ones rise) for the stage tests."""
     p00 = load_case(KIT / "input" / "p00.in")
     trophies = p00["trophies"]
     base = p00["history"][-1]["rates"]
@@ -162,6 +118,36 @@ def test_stage02():
         segs.append((t0 + timedelta(hours=dh), P, rates))
     at = t0 + timedelta(hours=36)
     case = make_synthetic_case(segs, at, 90, at + timedelta(minutes=90), trophies)
+    return case, segs
+
+
+def test_stage01():
+    """Stage 0-1 on a synthetic multi-segment history (hand-built anchors)."""
+    print("== Stage 0-1: segmentation + adoption + renewal (synthetic) ==")
+    case, _ = _synthetic_case()
+    segments = M.segment_history(case)
+    print(f"  reads: {len(case['history'])}, segments detected: {len(segments)} (want 4)")
+    assert len(segments) == 4, "segmentation failed"
+    for s in segments:
+        print(f"    {s['start']} P={s['P']} rates[0,2,19]={s['rates'][0]},{s['rates'][2]},{s['rates'][19]}")
+    t_rel = M.parse_time(case["game"]["release_date"])
+    fit = M.fit_adoption(segments, t_rel)
+    print(f"  adoption: a={fit['a']:.3f} b={fit['b']:.3f} sigma={fit['sigma']:.3f} "
+          f"max_daily_growth={fit['max_daily_growth']:.2f}")
+    gaps = M.fit_gaps(segments)
+    print(f"  gaps model: {gaps}")
+    rng = random.Random(M.SEED)
+    times = M.simulate_refresh_times(rng, gaps, segments[-1]["start"], M.parse_time(case["at"]),
+                                     M.parse_time(case["at"]) + timedelta(days=4.5))
+    print(f"  simulated refreshes to target+4.5d: {len(times)} (first {times[0] if times else None})")
+    print("  Stage 0-1 OK")
+    return True
+
+
+def test_stage02():
+    """Stage 2: trophy curves + M0/M1/M2 shrinkage on the synthetic history."""
+    print("== Stage 2: trophy curves + shrinkage ==")
+    case, _ = _synthetic_case()
     segments = M.segment_history(case)
     fit = M.fit_trophy_curves(case, segments)
     print(f"  rho={fit['rho']:.3f} sigma_res={fit['sigma_res']:.3f} sigma_g={fit['sigma_g']:.3f}")
@@ -185,9 +171,125 @@ def test_stage02():
     return True
 
 
+def _model_truth_case(seed: int = 7, n_seg: int = 20, seg_hours: int = 6):
+    """History GENERATED FROM the cohort model (known a, k, j per trophy, P
+    from the adoption curve, refreshes every seg_hours). The fit should
+    recover it, so this is the clean ground for the ablation test and Leg C.
+    Returns (case, segments, truth)."""
+    p00 = load_case(KIT / "input" / "p00.in")
+    trophies = p00["trophies"]
+    base = p00["history"][-1]["rates"]
+    rng = random.Random(seed)
+    truth = []
+    for r in base:
+        truth.append((max(r, 0.005),
+                      rng.choice([0.005, 0.02, 0.08, 0.3, 1.0]),
+                      rng.choice([0.0, 0.001, 0.01, 0.05])))
+    t_rel = datetime(2026, 11, 19, 0, 0, tzinfo=timezone.utc)
+    t0 = datetime(2026, 11, 18, 23, 50, tzinfo=timezone.utc)
+    segs = []
+    P = 638.0
+    E = [P * r / 100.0 for r in base]
+    for s in range(n_seg):
+        t = t0 + timedelta(hours=seg_hours * s)
+        tau = M.hours_between(t_rel, t)
+        Pnew = math.exp(6.44 + 1.358 * math.log1p(tau))
+        rates = []
+        for i, (a, k, j) in enumerate(truth):
+            E[i] = (a / 100) * P + (E[i] - (a / 100) * P) * math.exp(-k * seg_hours)
+            E[i] += (j / 100) * (Pnew - P)
+            rates.append(round(min(max(100 * E[i] / Pnew, 0.0), 100.0), 2))
+        segs.append((t, int(round(Pnew)), rates))
+        P = Pnew
+    at = t0 + timedelta(hours=seg_hours * n_seg)
+    case = make_synthetic_case(segs, at, 90, at + timedelta(minutes=90), trophies)
+    return case, M.segment_history(case), truth
+
+
+def _path_rate(a, k, j, r0, b_scale, n_steps: int = 18, step_h: int = 6):
+    """Direct recursion of one trophy over 4.5 days under a P path whose
+    adoption slope is scaled by b_scale. The P0 unit test: P must move R."""
+    t_rel = datetime(2026, 11, 19, 0, 0, tzinfo=timezone.utc)
+    t = datetime(2026, 11, 20, 5, 50, tzinfo=timezone.utc)
+    P = 90000.0
+    E = P * r0 / 100.0
+    for _ in range(n_steps):
+        tau = M.hours_between(t_rel, t + timedelta(hours=step_h))
+        Pnew = math.exp(6.44 + 1.358 * b_scale * math.log1p(tau))
+        E = (a / 100) * P + (E - (a / 100) * P) * math.exp(-k * step_h)
+        E += (j / 100) * (Pnew - P)
+        P = Pnew
+        t += timedelta(hours=step_h)
+    return 100 * E / P
+
+
+def test_stage03():
+    """Stage 3: joint scenarios + the P0 ablation test.
+
+    Ting's P0 fix demands proof: change the P growth rate and the predicted
+    rate MUST move. If it does not move, the model is still wrong (P would
+    have cancelled out of the rate equation). The decisive test is the
+    direct recursion on slow-k trophies (where the P effect lives — fast-k
+    trophies converge to their asymptote within the horizon, so their
+    population-mean movement is small by construction); the scenario-level
+    ablation on model-truth data is reported alongside."""
+    print("== Stage 3: joint scenarios + ablation (P growth must move rates) ==")
+    case, _ = _synthetic_case()
+    # Lengthen the horizon to 4.5 days so the growth difference can bite.
+    t_target = M.parse_time(case["at"]) + timedelta(days=4.5)
+    case["target"] = t_target.strftime("%Y-%m-%dT%H:%M:%SZ")
+    case["horizon_minutes"] = int(4.5 * 1440)
+    segments = M.segment_history(case)
+    ctx = M.build_context(case, segments)
+    t0 = time.time()
+    cols = M.run_scenarios(ctx, "M0", 1500, M.SEED)
+    fc = M.quantiles_from_scenarios(ctx, cols)
+    dt = time.time() - t0
+    print(f"  1500 scenarios in {dt:.2f}s; sample rows:")
+    for i in (0, 1, 2, 19):
+        print(f"    id{i+1}: q={fc['trophies'][i]['q']} (last observed "
+              f"{segments[-1]['rates'][i]})")
+    # (a) Direct recursion proof on slow-k trophies.
+    print("  direct recursion (P growth x1.5 / x0.5 vs x1.0):")
+    worst = 99.0
+    for (a, k, j, r0) in [(5.0, 0.005, 0.1, 1.0), (5.0, 0.02, 0.1, 1.0),
+                          (20.0, 0.005, 0.0, 3.0), (0.5, 0.005, 0.0, 0.1)]:
+        rf = _path_rate(a, k, j, r0, 1.5)
+        rb = _path_rate(a, k, j, r0, 1.0)
+        rs = _path_rate(a, k, j, r0, 0.5)
+        df = abs(M.logit(max(rf, 0.01)) - M.logit(max(rb, 0.01)))
+        ds = abs(M.logit(max(rs, 0.01)) - M.logit(max(rb, 0.01)))
+        worst = min(worst, df, ds)
+        print(f"    a={a} k={k} j={j}: fast={rf:.3f} base={rb:.3f} slow={rs:.3f} "
+              f"|dlogit| fast={df:.3f} slow={ds:.3f}")
+    assert worst > 0.1, "ABLATION FAILED: P growth does not move the rate"
+    # (b) Scenario-level ablation on model-truth data (diagnostic numbers).
+    case2, segments2, _ = _model_truth_case()
+    t_target2 = M.parse_time(case2["at"]) + timedelta(days=4.5)
+    case2["target"] = t_target2.strftime("%Y-%m-%dT%H:%M:%SZ")
+    case2["horizon_minutes"] = int(4.5 * 1440)
+    ctx2 = M.build_context(case2, segments2)
+    med = {}
+    for label, scale in (("fast", 1.5), ("base", 1.0), ("slow", 0.5)):
+        cols_s = M.run_scenarios(ctx2, "M0", 800, M.SEED, adoption_scale=scale)
+        fc_s = M.quantiles_from_scenarios(ctx2, cols_s)
+        med[label] = [r["q"][2] for r in fc_s["trophies"]]
+    idx = [i for i in range(55) if 0.1 < med["base"][i] < 90]
+    d_fast = sum(abs(M.logit(med["fast"][i]) - M.logit(med["base"][i])) for i in idx) / len(idx)
+    d_slow = sum(abs(M.logit(med["slow"][i]) - M.logit(med["base"][i])) for i in idx) / len(idx)
+    up = sum(1 for i in idx if med["slow"][i] > med["base"][i])
+    print(f"  scenario ablation (model-truth, {len(idx)} non-floor): "
+          f"mean |dlogit| fast={d_fast:.3f} slow={d_slow:.3f}; "
+          f"slow-growth raises the median for {up}/{len(idx)} trophies")
+    assert d_slow > 0.01 and up > len(idx) // 2, "scenario ablation: wrong direction"
+    print("  Stage 3 OK (ablation passes: P growth moves predicted rates)")
+    return True
+
+
 def main():
     ok = test_stage01()
     ok = test_stage02() and ok
+    ok = test_stage03() and ok
     print("ALL STAGE TESTS PASSED" if ok else "FAILED")
     return 0 if ok else 1
 

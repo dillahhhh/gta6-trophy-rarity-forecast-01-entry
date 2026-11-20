@@ -123,20 +123,94 @@ trophies (direction correct).
   typically narrower than 90%-coverage spreads — so this is a noted
   limitation, not a failure.
 
+## Finalization (20 Nov 2026 — Ting GO, locked config)
+
+Ting's finalization verdict: lock M0 + lambda 1.25, drop the stress floor
+if the final spread check says the wider spread hurts pinball. All 8
+checklist items are done (see the checklist at the end of this section).
+
+### Locked config
+- **Variant: M0** (population shrinkage). M1 won Leg A on the simulator by
+  0.007 (0.308 vs 0.315) — too weak (3 origins, near-identical variants,
+  simulator-dependent) to let runtime re-selection override the config on
+  the real final case. M1/M2 code is kept as comparison experiments
+  (tools/backtest.py still selects M1 in dev); `model_forecast` runs M0.
+- **Lambda = 1.25** (Leg A grid optimum, mean pinball-logit 0.108).
+- **No stress floor.** Final spread check (tools/final_spread_check.py,
+  Leg C, M0, same scenario columns for every candidate):
+  - seed 7: A λ1.25 no-floor 0.2193/cov 0.82; B λ1.25+floor 0.2216/cov 0.82;
+    C λ1.00 0.2235/cov 0.71; D λ1.50 0.2216/cov 0.87.
+  - seed 11: A 0.2238/cov 0.67; B 0.2261/cov 0.67; C 0.2309/cov 0.65;
+    D 0.2206/cov 0.80.
+  - The floor widened only 1/55 trophies, HURT mean pinball-logit on BOTH
+    seeds and did NOT improve coverage on either. Per Ting's rule
+    (pinball decides, coverage is diagnostic) the wider spread was NOT
+    picked. λ=1.25 is a local optimum on seed 7 and within 0.003 of the
+    best (λ=1.50) on seed 11 — no consistent improvement from widening.
+- **Leg C undercoverage is a recorded limitation, not a failure:** coverage
+  0.82 (seed 7) / 0.67 (seed 11) at λ=1.25, below the nominal 0.90, in
+  every tested spread (λ=1.50 reaches 0.87/0.80 but does not consistently
+  improve pinball: better on seed 11 by 0.003, worse on seed 7 by 0.002).
+  Lambda was calibrated on ~1.5-day origins and applied to a 4.5-day
+  horizon (horizon mismatch). Pinball (the competition metric) still
+  favours the model over the starter, and pinball-optimal spreads are
+  typically narrower than 90%-coverage spreads. Do not widen just to
+  chase 0.90 coverage.
+
+### Stress scenarios (locked config, long 20-segment case)
+tools/final_validation.py — all VALID (55 rows, q monotone, in [0,100]):
+fast refresh (gaps x0.5), slow refresh (gaps x2.0), NO refresh until
+target, player growth x1.5, player growth x0.5.
+
+### Runtime, repeated (locked config, long 20-segment case)
+- In-process `model_forecast` x5: 2.32, 2.30, 2.31, 2.31, 2.31 s → max
+  **2.32 s**. Standalone CLI (`python3 -P -s main.py`) x3: 2.44, 2.39,
+  2.40 s → max **2.44 s**. Full pipeline in backtest stage 4: 2.46 s.
+  Target was max <6.5 s, limit 8 s. Locking the config (no runtime Leg A
+  selection/calibration) cut the pipeline from ~5 s to ~2.4 s; no
+  numerical optimisation was needed and no output was changed by any
+  optimisation (none applied).
+
+### Final validation (locked code)
+- Harness: PASS p00/p01 (55 rows, q non-decreasing, in [0,100],
+  ≤65536 B, two runs byte-identical).
+- Full backtest: ALL STAGE TESTS PASSED (stages 1–5 + legs). Stage 3
+  ablation still passes (P0 fix intact). Stage 4 dev Leg A still selects
+  M1 (0.308) — dev only; production is locked M0.
+- Determinism: two `model_forecast` runs byte-identical on the long case.
+- Fallbacks: one-segment and fit-failure (P=0) cases → starter, valid.
+- Leg C (locked, seed 7): model pinball-logit **0.219**, coverage90 0.82;
+  starter 0.259/1.00. Median |logit| error M0=M1=M2=0.297.
+- Leg B (diagnostic only): unchanged, 2.996/0.11 (starter's number).
+
+### Checklist (Ting finalization, 8 items)
+1. [x] M0 locked as final candidate (M1/M2 kept as dev comparisons).
+2. [x] λ=1.25 baseline kept; final spread check done (pinball decides);
+    wider spread NOT picked; Leg C undercoverage recorded as limitation.
+3. [x] Stress scenarios run, output valid (fast/slow/no-refresh, ±growth).
+4. [x] Runtime repeated, max 2.44 s < 6.5 s target (limit 8 s).
+5. [x] Final validation: format/determinism/fallback on p00/p01 + long case.
+6. [x] Results + limitations recorded here.
+7. [x] Anchor shown before first write (round 34120697).
+8. [x] Incremental commits + push (9f3ae98 lock; this file next).
+
 ## Verdict
 
-- **Winning variant: M1** (tier shrinkage), chosen by Leg A on the
-  model-truth simulator — but M0 is within 0.007, so the choice is weak
-  evidence; on the final case the Leg A machinery re-selects from the
-  real history.
-- **Lambda = 1.25** (Leg A, mean pinball-logit objective).
+- **Winning variant: M0** (population shrinkage), LOCKED by Ting's
+  finalization decision (20 Nov 2026) — NOT M1. The dev Leg A still picks
+  M1 on the model-truth simulator (0.308 vs M0 0.315), but that margin is
+  0.007 on 3 simulator origins and the runtime re-selection is disabled:
+  production runs M0 on every case, including the final case.
+- **Lambda = 1.25** (Leg A, mean pinball-logit objective), locked.
+- **Stress floor: DROPPED** by the final spread check (hurts pinball on
+  both Leg C seeds, no coverage gain).
 - **Does the model beat the starter?** On the only evaluation where the
-  model can run (Leg C, synthetic model-truth, 4.5 d): YES, 0.222 vs
-  0.259 pinball-logit. On real data there is NO comparison available:
-  the practice history is frozen (the model falls back to the starter),
-  and Leg B is the starter's number. The final case (f00) will have a
-  real multi-segment history; the model will run there, but whether it
-  beats the best house entry on the real final case is UNVERIFIED until
+  model can run (Leg C, synthetic model-truth, 4.5 d): YES, 0.219 vs
+  0.259 pinball-logit (locked config). On real data there is NO comparison
+  available: the practice history is frozen (the model falls back to the
+  starter), and Leg B is the starter's number. The final case (f00) will
+  have a real multi-segment history; the model will run there, but whether
+  it beats the best house entry on the real final case is UNVERIFIED until
   the final case arrives. Do not claim otherwise.
-- **Runtime:** ~5 s on a 20-segment 4.5-day case (limit 8 s). Deterministic
+- **Runtime:** ~2.4 s on a 20-segment 4.5-day case (limit 8 s). Deterministic
   (two runs byte-identical). Format valid (harness PASS on p00/p01).

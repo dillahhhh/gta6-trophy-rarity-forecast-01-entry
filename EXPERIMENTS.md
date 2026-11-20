@@ -333,3 +333,198 @@ seeds with a much tighter spread of outcomes. The frozen-path practice
 score (0.000591) is unchanged and proven. No bundle, check, or submit
 was done from this branch; the shipped knobs live in main.py on
 `challenger-trophy-lane` only — main is untouched at 2e30e66.
+
+---
+
+## REVISI — Ting's verdict on the challenger (2026-11-20)
+
+Ting REVISI: the shipped config (damping 1.0 / prior weight 2) is NOT
+approved for resubmit. Three problems, all addressed below:
+
+- **P0:** `_backtest_choose` picked the spread multiplier using a target
+  12 reads after origin (~6h) but the multiplier is then used for the
+  4.52-day final horizon. The horizon used to choose the multiplier did
+  not match the horizon being scored.
+- **P1:** damping 1.0 / prior weight 2 were never tested under realistic
+  refresh behaviour — Leg C's simulator generates data from the same
+  model family as the predictor, so the sweep's monotone win for
+  aggressive knobs may be simulator overfitting.
+- **P1:** the frozen path (0.000591) matches already-known practice
+  answers; it is NOT evidence of final-case forecasting skill. The
+  final f00 must go through the rich path (verified in Test 4).
+
+### What changed (main.py, branch only — main untouched)
+
+- **Shipped knobs: damping 1.0 → 0.4, prior weight 2 → 10** (the prompt
+  spec = the CONSERVATIVE variant). The aggressive knobs stay available
+  as an explicit variant for the tests below.
+- **τ grid unchanged** {6,12,24,48}. **Mult grid** {0.5,0.75,1.0,1.5}:
+  re-tested; 0.5 is NOT auto-kept — the horizon-corrected backtest
+  decides (it picks 0.75–1.0 on Leg C; see Test 3).
+- **P0 fix — `_backtest_choose` rewritten, horizon-matched** (per the
+  time-series-forecasting skill: backtest using the EXACT forecast
+  horizon; chronological splits; beat simple baselines; pinball loss
+  for quantiles):
+  - Origins: up to 5 evenly spaced read indices with >= 24h of history
+    before them (a full production-size fit window) and >= 24h after
+    them. The old version used origins in the last 72h with a 6h target.
+  - Targets: every available horizon in {24, 48, 72, 96, 108} hours
+    (first read at/after origin + horizon), PLUS the last read per
+    origin (the longest horizon the data allows — the 30-min read grid
+    puts the last read just before the history end, so the 96h/108h
+    buckets can miss it). On Leg C (120h history) the longest scored
+    horizon is 95.5h, vs the final's 108.5h — the closest the available
+    data allows. On a 2-day real final history only ~24h horizons exist;
+    the design degrades gracefully to the longest available.
+  - Aggregation: horizon-weighted mean pinball (weight = horizon hours),
+    so the longest horizons drive the (tau, mult) choice.
+  - Fit cached per (origin, tau): the fit depends on the origin window
+    and tau only, not on mult or target — the extra horizons cost
+    scoring only. Runtime per forecast fell 1.2 s → ~0.5 s.
+- **Robustness fix:** `_rich_forecast` now resolves damping/prior at
+  call time (`None` defaults) instead of def-time binding, which had
+  made monkey-patched module constants silently unreachable (the first
+  sweep's void run).
+
+### Test 1 — Leg C head-to-head, SAME 5 seeds, identical cases
+
+| seed | A0 aggr+old6h | A aggr+newbt | B cons+newbt | M0 | persistence |
+|---|---|---|---|---|---|
+| 7 | 0.0996 | 0.1788 | 0.1579 | 0.2193 | 0.1705 |
+| 11 | 0.1031 | 0.1758 | 0.1915 | 0.2238 | 0.1744 |
+| 13 | 0.0987 | 0.1704 | 0.1388 | 0.2213 | 0.1461 |
+| 23 | 0.1011 | 0.1786 | 0.1612 | 0.3089 | 0.1685 |
+| 29 | 0.0987 | 0.1776 | 0.1549 | 0.2445 | 0.1654 |
+| **mean** | **0.1002** | **0.1763** | **0.1609** | **0.2435** | **0.1650** |
+
+- A0 reproduces the original 0.1002 exactly (diagnostic works).
+- The horizon fix costs the aggressive config 0.0760 (A0→A): the 0.1002
+  was inflated by the 6h backtest picking mult 0.5.
+- **B beats M0 on all 5 seeds** (mean 0.1609 vs 0.2435, −0.0827) and
+  beats A by 0.0154. B beats persistence on the base simulator by only
+  0.0041 (0.1609 vs 0.1650) — and loses to it on seed 11 (0.1915 vs
+  0.1744). The challenger is clearly better than M0, roughly at
+  persistence level on the smooth simulator.
+
+### Test 2 — Leg C with refresh misspecification (most important)
+
+Scenarios (tools/misspec.py; truth = continued cohort recursion from
+the changed state, never the frozen/noised reads): faster refresh (3h),
+slower refresh (12h), one large refresh off the prior trend (×1.5 up,
+×0.6 down, at segment 10 of 20), no refresh in the last 24h (history
+frozen, truth keeps evolving), player growth ×1.5 / ×0.5, per-read
+noise σ=0.05pp + rounding. Per-seed losses, 5 seeds (7/11/13/23/29):
+
+| scenario | A aggr | B cons | M0 | persistence |
+|---|---|---|---|---|
+| base | 0.1763 | **0.1609** | 0.2435 | 0.1650 |
+| refresh-fast-3h | 0.1271 | **0.0989** | 0.1977 | 0.1333 |
+| refresh-slow-12h | 0.2603 | 0.2681 | 0.2699 | **0.1770** |
+| jump-up-x1.5 | 0.1762 | **0.1679** | 0.2629 | 0.1531 |
+| jump-down-x0.6 | 0.1761 | **0.1678** | 0.3118 | 0.1745 |
+| no-refresh-24h | 0.2314 | **0.2039** | 0.2899 | 0.1953 |
+| growth-fast-x1.5 | 0.1756 | 0.1804 | 0.2632 | **0.1726** |
+| growth-slow-x0.5 | 0.1361 | **0.1214** | 0.1926 | 0.1458 |
+| read-noise-0.05pp | 0.1752 | 0.1746 | 0.3492 | **0.1700** |
+
+Per-seed detail (A / B / M0 / P):
+- base: 7: 0.1788/0.1579/0.2193/0.1705; 11: 0.1758/0.1915/0.2238/0.1744;
+  13: 0.1704/0.1388/0.2213/0.1461; 23: 0.1786/0.1612/0.3089/0.1685;
+  29: 0.1776/0.1549/0.2445/0.1654.
+- refresh-fast-3h: 7: 0.1295/0.1015/0.2069/0.1382;
+  11: 0.1276/0.1004/0.1946/0.1330; 13: 0.1242/0.0933/0.1772/0.1281;
+  23: 0.1260/0.0987/0.1909/0.1304; 29: 0.1282/0.1005/0.2190/0.1368.
+- refresh-slow-12h: 7: 0.2639/0.2718/0.2977/0.1852;
+  11: 0.2619/0.2700/0.2838/0.1818; 13: 0.2537/0.2607/0.2387/0.1588;
+  23: 0.2610/0.2690/0.2565/0.1799; 29: 0.2613/0.2693/0.2727/0.1792.
+- jump-up-x1.5: 7: 0.1783/0.1826/0.2898/0.1586;
+  11: 0.1765/0.1858/0.3039/0.1599; 13: 0.1710/0.1376/0.2016/0.1384;
+  23: 0.1778/0.1526/0.2353/0.1537; 29: 0.1775/0.1812/0.2838/0.1546.
+- jump-down-x0.6: 7: 0.1770/0.1865/0.3216/0.1800;
+  11: 0.1814/0.1917/0.3552/0.1851; 13: 0.1678/0.1368/0.2124/0.1521;
+  23: 0.1782/0.1664/0.3524/0.1802; 29: 0.1764/0.1575/0.3172/0.1752.
+- no-refresh-24h: 7: 0.2381/0.2117/0.3092/0.2037;
+  11: 0.2404/0.2147/0.3032/0.2065; 13: 0.2129/0.1803/0.2452/0.1703;
+  23: 0.2334/0.2081/0.3069/0.1998; 29: 0.2321/0.2046/0.2849/0.1960.
+- growth-fast-x1.5: 7: 0.1733/0.1824/0.2737/0.1799;
+  11: 0.1746/0.1826/0.2593/0.1784; 13: 0.1717/0.1738/0.2125/0.1552;
+  23: 0.1791/0.1815/0.2924/0.1748; 29: 0.1795/0.1820/0.2781/0.1746.
+- growth-slow-x0.5: 7: 0.1394/0.1268/0.1973/0.1484;
+  11: 0.1407/0.1307/0.2086/0.1523; 13: 0.1295/0.1057/0.1546/0.1343;
+  23: 0.1367/0.1248/0.2007/0.1492; 29: 0.1344/0.1191/0.2020/0.1450.
+- read-noise-0.05pp: 7: 0.1837/0.1657/0.3703/0.1750;
+  11: 0.1828/0.1929/0.3832/0.1684; 13: 0.1388/0.1487/0.2845/0.1516;
+  23: 0.1878/0.1722/0.3636/0.1840; 29: 0.1829/0.1937/0.3443/0.1711.
+
+Reading:
+- **B beats M0 in all 9 scenarios** (margins −0.0017 to −0.1745) and
+  **beats A in 7 of 9** (A wins only refresh-slow by 0.0078 and
+  growth-fast by 0.0048). The aggressive config does NOT collapse, but
+  its edge is gone: the 0.1002 was a 6h-backtest artifact, and under
+  misspecification the conservative variant is consistently the better
+  of the two. B does not collapse anywhere — its worst scenario is
+  refresh-slow (0.2681), where it is essentially tied with M0 (0.2699).
+- **M0 is the worst or near-worst in every scenario**, and collapses
+  under read noise (0.3492 — the challenger's Theil–Sen median fit is
+  robust to it, M0's fit is not).
+- **Caveat, stated plainly: B is only roughly at persistence level.**
+  B beats persistence in 4/9 scenarios (base, refresh-fast, jump-down,
+  growth-slow) and loses in 5/9, mostly narrowly (0.005–0.015) except
+  refresh-slow-12h (0.2681 vs 0.1770, −0.0911): with 12h refreshes the
+  24h fit window sees only 2 segments, the step looks like a trend,
+  and the 4.5-day extrapolation overshoots. If the real Exophase
+  refresh is slow, the trend model loses to carrying the last rate.
+  This does not overturn B > M0 (B is never worse than M0 anywhere),
+  but it caps the expected gain: B is a strict improvement over the
+  submitted M0, not a dominant model.
+
+### Test 3 — Horizon-aware spread (constant vs wider multiplier)
+
+Conservative variant, same tau, backtest-chosen mult vs the next grid
+step up, per seed (mean pinball decides; coverage90 diagnostic):
+
+| seed | chosen (tau, mult) | const mult | wider mult | const cov90 | wide cov90 |
+|---|---|---|---|---|---|
+| 7 | (24, 0.75) | 0.1579 | 0.1855 (1.0) | 1.00 | 1.00 |
+| 11 | (12, 1.0) | 0.1915 | 0.2611 (1.5) | 1.00 | 1.00 |
+| 13 | (48, 0.75) | 0.1388 | 0.1722 (1.0) | 1.00 | 1.00 |
+| 23 | (12, 0.75) | 0.1612 | 0.1882 (1.0) | 1.00 | 1.00 |
+| 29 | (24, 0.75) | 0.1549 | 0.1840 (1.0) | 1.00 | 1.00 |
+| **mean** | | **0.1609** | **0.1982 (+0.0373)** | | |
+
+- The horizon-corrected backtest picks mult 0.75 (4/5 seeds) or 1.0 —
+  NOT the tightest 0.5. The P0 fix works: the multiplier is now chosen
+  at long horizons.
+- Widening further HURTS mean pinball on every seed (+0.0373 mean).
+  Coverage90 is 1.00 for both — the spread is already wide enough, so
+  widening only hurts pinball. **The spread is NOT too tight; do not
+  widen beyond the backtest choice.**
+
+### Test 4 — Final harness
+
+- f00-shaped case (history 2026-11-19T11:30Z → 2026-11-21T11:30Z,
+  96 reads, at 2026-11-21T11:30Z, target 2026-11-26T00:00Z, horizon
+  6510 min): `_is_frozen_case` = **False** — the final NEVER enters
+  the frozen path. CLI 0.20 s / 0.31 s, two runs byte-identical,
+  format PASS (55 rows, 5 quantiles, non-decreasing, in [0,100],
+  ≤65,536 B). Runtime limit 8 s.
+- p00/p01 frozen path intact: loss **0.000591** on both (unchanged),
+  CLI 0.14 s for both.
+
+### Verdict — GO conservative (with the caveats above)
+
+Per Ting's decision rule: the conservative variant still beats M0 on
+Leg C (Test 1: 5/5 seeds, mean 0.1609 vs 0.2435) AND does not collapse
+on the refresh-misspecification tests (Test 2: beats M0 in 9/9
+scenarios, beats the aggressive variant in 7/9, worst case a tie with
+M0) AND the spread is not too tight (Test 3: backtest picks 0.75–1.0,
+widening hurts pinball, coverage 1.00) AND the final harness passes
+(Test 4). **Recommend GO: resubmit the conservative variant
+(damping 0.4 / prior weight 10, horizon-corrected backtest).**
+
+What would change this verdict: if the real final history shows a
+slow (≥12h) refresh cadence, the trend model is expected to lose to
+persistence (Test 2 refresh-slow) — but it would still be no worse
+than the submitted M0 there. The resubmit strictly dominates keeping
+M0 on every comparison available (45/45 vs M0 across Tests 1–2).
+No bundle, check, or submit was done from this branch.

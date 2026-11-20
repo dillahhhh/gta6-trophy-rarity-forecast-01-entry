@@ -45,19 +45,27 @@ PRACTICE_TARGETS = {
     (2026, 11, 19, 5, 0),
 }
 
-# Rich-path knobs. Defaults are the prompt spec; the shipped values are the
-# winners of the Leg C variant sweep (see EXPERIMENTS.md).
-#   DAMPING 1.0 (spec 0.4): full trend extrapolation — the Leg C trend
-#     signal is real and persists over 4.5 days; damping only under-shoots.
-#   PRIOR_WEIGHT 2 (spec 10): near-flat shrinkage — the band prior barely
-#     moves the slope on Leg C; heavy shrinkage only drags it toward 0.
+# Rich-path knobs. The shipped values are the CONSERVATIVE variant
+# (damping 0.4, prior weight 10 = the prompt spec), per Ting's REVISI
+# (2026-11-20): the Leg C sweep winners (damping 1.0, prior 2) were
+# NOT approved — Leg C's simulator generates data from the same model
+# family as the predictor, so the monotone win for aggressive knobs
+# is likely simulator overfitting, and the aggressive knobs were never
+# tested under realistic refresh behaviour. The conservative variant
+# is the shipped default; the aggressive knobs stay available as an
+# explicit variant for the revision tests (see EXPERIMENTS.md).
+#   DAMPING 0.4 (spec): damped trend extrapolation — the trend is
+#     shrunk toward the last rate, the honest choice when refresh
+#     jumps can break the trend.
+#   PRIOR_WEIGHT 10 (spec): the band prior pulls the slope toward the
+#     band median; heavy shrinkage is the conservative choice.
 #   TAU_GRID unchanged (spec): inert on Leg C — every grid scores the same.
-#   MULT_GRID +0.5 (spec {0.75,1.0,1.5} plus 0.5): the backtest picks the
-#     tightest spread the case's own history justifies; 1.5 stays as the
-#     safety valve for a noisy real final. 0.25/0.35 were tested and
-#     rejected as simulator overfitting (they ride the sigma clip floor).
-RICH_DAMPING = 1.0
-RICH_PRIOR_WEIGHT = 2
+#   MULT_GRID {0.5, 0.75, 1.0, 1.5}: the horizon-corrected backtest
+#     (see _backtest_choose) decides; 0.5 is NOT auto-kept. 0.25/0.35
+#     were tested and rejected as simulator overfitting (they ride the
+#     sigma clip floor).
+RICH_DAMPING = 0.4
+RICH_PRIOR_WEIGHT = 10
 RICH_TAU_GRID = (6, 12, 24, 48)
 RICH_MULT_GRID = (0.5, 0.75, 1.0, 1.5)
 
@@ -275,59 +283,126 @@ def _forecast_window(reads, target_dt, horizon_h, tau, mult,
 
 
 def _backtest_choose(reads_all, damping, prior_weight):
-    """Rolling-origin backtest on the case's own history.
+    """Rolling-origin backtest on the case's own history, horizon-matched.
 
-    Origins: up to 5 evenly spaced read indices inside the last 72h of
-    history (excluding the final 6h), each with >= 12 reads before it.
-    For each origin, fit on the 24h before it and forecast the read 6h
-    later; score full 5-level pinball-logit against that read. Chooses
-    the (tau, mult) minimising the mean over origins and trophies.
-    Defaults to (12, 1.0) when no usable origin exists.
+    The production forecast fits the last 24h and extrapolates ~4.5 days,
+    so the (tau, mult) choice must be scored at LONG horizons. The
+    previous version scored the read 12 reads (6h) after each origin and
+    then applied the chosen multiplier to a 4.5-day forecast — a horizon
+    mismatch (P0): a spread that is right at 6h is far too tight at
+    4.5 days, because trend error grows with horizon while the 6h
+    backtest never sees it.
+
+    Origins: up to 5 evenly spaced read indices with >= 24h of history
+    before them (a full production-size fit window) and >= 24h after
+    them. For each origin the fit uses the 24h before it (exactly as
+    production does); the score is the mean 5-level pinball-logit
+    against the reads at every available target horizon in
+    {24, 48, 72, 96, 108} hours (first read at/after origin + horizon),
+    weighted by horizon length so the longest available horizons drive
+    the choice. If the history is too short for any 24h+ horizon, fall
+    back to the longest available horizon per origin (the last read).
+    Defaults to (12, 1.0) when nothing is usable.
+
+    The Theil-Sen fit is cached per (origin, tau): the fit depends on
+    the origin window and tau only, not on mult or the target horizon,
+    so the extra target horizons cost scoring only, not re-fitting.
     """
-    if len(reads_all) < 25:
+    n = len(reads_all)
+    if n < 25:
         return 12, 1.0
-    end = reads_all[-1][0]
-    lo = end - timedelta(hours=72)
-    cand = [i for i, (dt, _) in enumerate(reads_all)
-            if dt >= lo and dt <= end - timedelta(hours=6) and i >= 12
-            and i + 12 < len(reads_all)]
+    start_dt = reads_all[0][0]
+    end_dt = reads_all[-1][0]
+    # Candidate origins: full 24h fit window before, >= 24h after.
+    cand = [i for i in range(n)
+            if (reads_all[i][0] - start_dt).total_seconds() >= 24 * 3600
+            and (end_dt - reads_all[i][0]).total_seconds() >= 24 * 3600]
     if not cand:
-        return 12, 1.0
+        cand = [i for i in range(n) if i >= 12 and i + 12 < n]
+        if not cand:
+            return 12, 1.0
     if len(cand) > 5:
         step = (len(cand) - 1) / 4.0
         cand = sorted({cand[int(round(k * step))] for k in range(5)})
+    horizons_h = (24.0, 48.0, 72.0, 96.0, 108.0)
+    jobs = []  # (origin_idx, target_idx, horizon_h)
+    for oi in cand:
+        odt = reads_all[oi][0]
+        seen_targets = set()
+        for h in horizons_h:
+            tgt = odt + timedelta(hours=h)
+            j = next((k for k in range(oi + 1, n)
+                      if reads_all[k][0] >= tgt), None)
+            if j is not None and j not in seen_targets:
+                seen_targets.add(j)
+                jobs.append((oi, j, h))
+        # Longest available horizon per origin: the last read. (The
+        # 30-min read grid means the last read sits just before the
+        # history end, so the 96h/108h buckets can miss it; without
+        # this the longest scored horizon on Leg C would be 72h, not
+        # the ~95h the data actually allows.)
+        h_last = (end_dt - odt).total_seconds() / 3600.0
+        if h_last > 24.0 and (n - 1) not in seen_targets:
+            seen_targets.add(n - 1)
+            jobs.append((oi, n - 1, h_last))
+    if not jobs:
+        # No 24h+ target exists: longest horizon per origin (last read).
+        for oi in cand:
+            h = (end_dt - reads_all[oi][0]).total_seconds() / 3600.0
+            jobs.append((oi, n - 1, h))
+    fits_cache = {}
+
+    def _get_fit(oi, tau):
+        key = (oi, tau)
+        if key not in fits_cache:
+            odt = reads_all[oi][0]
+            window = [(dt, r) for dt, r in reads_all
+                      if odt - timedelta(hours=24) < dt <= odt]
+            if len(window) < 2:
+                fits_cache[key] = None
+            else:
+                fits = _fit_window(window, tau)
+                fits_cache[key] = (window, fits, _band_priors(fits))
+        return fits_cache[key]
+
     best, best_score = (12, 1.0), None
     for tau in RICH_TAU_GRID:
         for mult in RICH_MULT_GRID:
-            total, cnt = 0.0, 0
-            for oi in cand:
-                origin_dt = reads_all[oi][0]
-                window = [(dt, r) for dt, r in reads_all
-                          if origin_dt - timedelta(hours=24) < dt <= origin_dt]
-                if len(window) < 2:
+            total, wsum = 0.0, 0.0
+            for oi, tj, h in jobs:
+                got = _get_fit(oi, tau)
+                if got is None:
                     continue
-                target_dt = reads_all[oi + 12][0]
-                horizon_h = (target_dt - origin_dt).total_seconds() / 3600.0
-                fc = _forecast_window(window, target_dt, horizon_h, tau, mult,
-                                      damping, prior_weight)
-                if fc is None:
-                    continue
-                truth = reads_all[oi + 12][1]
-                for (med, sig), y in zip(fc, truth):
+                window, fits, priors = got
+                target_dt = reads_all[tj][0]
+                horizon_h = (target_dt - reads_all[oi][0]).total_seconds() / 3600.0
+                t0 = window[0][0]
+                target_x = math.log1p((target_dt - t0).total_seconds() / 3600.0 / tau)
+                truth = reads_all[tj][1]
+                for idx, f in enumerate(fits):
+                    med, sig = _forecast_one(
+                        f, priors[_band(f["last_rate"])], tau, mult,
+                        damping, prior_weight, target_x, horizon_h)
                     qs = _quantiles_from(med, sig)
-                    yl = logit(y)
+                    yl = logit(truth[idx])
                     for tau_l, qv in zip(LEVELS, qs):
                         d = yl - logit(qv)
-                        total += 2.0 * max(tau_l * d, (tau_l - 1.0) * d)
-                        cnt += 1
-            if cnt and (best_score is None or total / cnt < best_score):
-                best_score = total / cnt
+                        total += h * 2.0 * max(tau_l * d, (tau_l - 1.0) * d)
+                        wsum += h
+            if wsum and (best_score is None or total / wsum < best_score):
+                best_score = total / wsum
                 best = (tau, mult)
     return best
 
 
-def _rich_forecast(case, damping=RICH_DAMPING,
-                   prior_weight=RICH_PRIOR_WEIGHT):
+def _rich_forecast(case, damping=None, prior_weight=None):
+    # Resolve the knobs at call time, not at def time: binding them as
+    # def-time defaults made monkey-patched module constants silently
+    # unreachable (the first sweep's void run). Explicit args still win.
+    if damping is None:
+        damping = RICH_DAMPING
+    if prior_weight is None:
+        prior_weight = RICH_PRIOR_WEIGHT
     at = parse_time(case["at"])
     target = parse_time(case["target"])
     horizon_h = case["horizon_minutes"] / 60.0

@@ -182,7 +182,25 @@ segments, where the trend is noise. A window-based guard does not work
   (data integrity), `python3 tools/r1_validate.py` (full battery,
   ~75 s), `python3 tools/r1_experiments.py` (knob/guard follow-ups).
   All tools are stdlib-only Python 3.
-- **`makefun check`**: (run after commit; results below.)
+- **`makefun check`** (run 2026-11-20 ~21:00 WIB on commit 7236e0e):
+  **5 passed, 1 failed, 15 skipped, 3 checked at submission.**
+  Passed: competition_open, snapshot (13 files, 80,069 bytes, within
+  caps), license_osi (MIT), entrypoint (main.py → python3.13),
+  repo_created_after_open (drand anchor valid, round 34120697).
+  Failed: **transcripts_present** (no transcripts uploaded yet) —
+  the bundle must be built from the agent sessions that wrote the
+  entry (see below). Skipped: the other transcript checks (nothing to
+  read without a bundle), committed_secret (no --dotenv), strategy_note
+  (not required). Checked at submission: repo_owner (the anchor
+  wallet ArPsR8vVHuM7iS1meDfAUk9mDZLKLNYtMjrgDiCPgeyL must be on the
+  submitting account), source_bundle, duplicate_snapshot.
+  Verdict: "not ready: fix transcripts_present, then check again."
+  The entry itself is structurally valid; only the transcript bundle
+  is missing. **The bundle must be run from the top-level (parent)
+  agent once its subagents have finished**, so the parent's session
+  and this subagent's session are both in it, each whole — a subagent
+  cannot bundle its parent's session. That step is for the parent
+  agent, not for this build.
 
 ## 7. Known risks and unresolved questions
 

@@ -55,9 +55,11 @@ Z = [-1.645, -0.674, 0, 0.674, 1.645]
 SIGMA = 0.5  # starter random-walk spread, logit units per sqrt day (fallback only)
 
 SEED = 20261121
-N_FINAL = 6000       # joint scenarios for the final forecast (tuned by timing)
-N_BACKTEST = 800     # joint scenarios per (origin, variant) in the Leg A backtest
-N_STRESS = 1500      # joint scenarios per stress variant
+N_FINAL = 2000      # joint scenarios for the final forecast (tuned by timing)
+N_BACKTEST = 250    # joint scenarios per Leg A origin (lambda calibration)
+N_STRESS = 250      # joint scenarios per stress run
+LAMBDA_GRID = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0]
+MAX_ORIGINS = 3     # Leg A uses at most this many origins (cost-bounded)
 LAMBDA_GRID = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0]
 LAMBDA_MIN, LAMBDA_MAX = 0.5, 3.0
 
@@ -372,50 +374,78 @@ def _logistic_pct(la: float) -> float:
     return 100.0 * e / (1.0 + e)
 
 
+def _cohort_coeffs(k: float, r0: float, segments: list[dict]):
+    """For a FIXED speed k, the earner count at each segment is AFFINE in
+    (a, j): E_m = C_m + a*A_m + j*B_m (the recursion is linear in a and j
+    once k is fixed). Precompute the three coefficient lists in one pass
+    (the only exp() calls); every (a, j) evaluation after that is cheap
+    arithmetic. This is what makes the (k, j) x golden-section grid fast."""
+    n = len(segments)
+    A = [0.0] * n
+    B = [0.0] * n
+    C = [0.0] * n
+    C[0] = r0 * segments[0]["P"] / 100.0
+    for m in range(n - 1):
+        dt = hours_between(segments[m]["start"], segments[m + 1]["start"])
+        d = math.exp(-k * dt) if dt > 0 else 1.0
+        P0 = segments[m]["P"]
+        dP = segments[m + 1]["P"] - P0
+        C[m + 1] = d * C[m]
+        A[m + 1] = d * A[m] + P0 * (1.0 - d) / 100.0
+        B[m + 1] = d * B[m] + dP / 100.0
+    return A, B, C
+
+
+def _rates_from_coeffs(A, B, C, a: float, j: float, segments: list[dict]):
+    """Segment rates for (a, j) given the precomputed coefficients."""
+    return [100.0 * (C[m] + a * A[m] + j * B[m]) / segments[m]["P"]
+            for m in range(len(segments))]
+
+
 def _recursion_rates(a: float, k: float, j: float, r0: float, segments: list[dict]) -> list[float]:
     """Rates (percent) at every segment start under (a, k, j). a, j, r0 in
-    percent; k per hour. The first segment's rate is r0 by construction."""
-    rates = []
-    P0 = segments[0]["P"]
-    E = P0 * r0 / 100.0
-    rates.append(r0)
-    for s in range(len(segments) - 1):
-        dt = hours_between(segments[s]["start"], segments[s + 1]["start"])
-        P = segments[s]["P"]
-        E = (a / 100.0) * P + (E - (a / 100.0) * P) * math.exp(-k * dt)
-        dP = segments[s + 1]["P"] - P
-        E = E + (j / 100.0) * dP
-        Pnew = segments[s + 1]["P"]
-        rates.append(100.0 * E / Pnew if Pnew > 0 else 0.0)
-    return rates
+    percent; k per hour. The first segment's rate is r0 by construction.
+    Thin wrapper over the coefficient form."""
+    A, B, C = _cohort_coeffs(k, r0, segments)
+    return _rates_from_coeffs(A, B, C, a, j, segments)
 
 
-def _cohort_loss(a: float, k: float, j: float, r0: float, segments: list[dict], intervals) -> float:
-    """Censored squared loss on the logit scale over segments after the first."""
-    rates = _recursion_rates(a, k, j, r0, segments)
+def _cohort_loss_coeffs(A, B, C, a: float, j: float, segments: list[dict], intervals) -> float:
+    """Censored squared loss on the logit scale over segments after the
+    first, from precomputed coefficients (no exp() calls)."""
     total = 0.0
     for s in range(1, len(segments)):
         iv = intervals[s]
         if iv is None:
             continue
-        d = _censored_resid(_logit_raw(rates[s]), iv)
+        rate = 100.0 * (C[s] + a * A[s] + j * B[s]) / segments[s]["P"]
+        d = _censored_resid(_logit_raw(rate), iv)
         total += d * d
     return total
+
+
+def _cohort_loss(a: float, k: float, j: float, r0: float, segments: list[dict], intervals) -> float:
+    """Censored squared loss on the logit scale over segments after the first."""
+    A, B, C = _cohort_coeffs(k, r0, segments)
+    return _cohort_loss_coeffs(A, B, C, a, j, segments, intervals)
 
 
 def _fit_one_trophy(segments: list[dict], intervals, r0: float):
     """Grid over (k, j) + golden-section over logit(a). Returns
     (a, k, j, rss, se_logk, se_logita, se_logitj) or None when there are no
-    usable later reads."""
+    usable later reads. The coefficients for each k are computed once, so
+    the (j, a) search is cheap arithmetic."""
     if not any(iv is not None for iv in intervals[1:]):
         return None
     la_lo, la_hi = _logit_raw(0.0001), _logit_raw(99.999)
     best = None
     for k in K_GRID:
+        A, B, C = _cohort_coeffs(k, r0, segments)
         for j in J_GRID:
-            def loss_la(la, k=k, j=j):
-                return _cohort_loss(_logistic_pct(la), k, j, r0, segments, intervals)
-            la = _golden_min(loss_la, la_lo, la_hi, iters=12)
+            def loss_la(la, A=A, B=B, C=C, j=j):
+                return _cohort_loss_coeffs(A, B, C, _logistic_pct(la), j,
+                                          segments, intervals)
+            la = _golden_min(loss_la, la_lo, la_hi, iters=8)
             a = _logistic_pct(la)
             l = loss_la(la)
             if best is None or l < best[0]:
@@ -765,11 +795,24 @@ def _scenario_rates(ctx: dict, variant: str, rng: random.Random, E_last: list[fl
         tau = hours_between(t_release, t)
         future_P.append(math.exp(a_ad + b_ad * math.log1p(max(tau, -0.9))))
     # Breakpoints: observed segments, then future refreshes up to t*.
+    # Precompute the FUTURE intervals once (dt, P at the interval start,
+    # P jump at its end) so the per-trophy loop is a bare recursion.
     points = [(seg["start"], seg["P"]) for seg in segments]
     for t, p in zip(refreshes, future_P):
         if t <= t_star:
             # P is monotone by construction (b > 0); guard anyway.
             points.append((t, max(p, points[-1][1])))
+    intervals = []
+    for m in range(len(points) - 1):
+        t0p, P0p = points[m]
+        t1p, P1p = points[m + 1]
+        if t1p <= segments[-1]["start"]:
+            continue  # past is already in E_last
+        dt = hours_between(t0p, t1p)
+        if dt <= 0:
+            continue
+        intervals.append((dt, P0p, P1p - P0p))
+    P_star = points[-1][1] if points else segments[-1]["P"]
     # (iii) Shared speed shock.
     g = math.exp(rng.gauss(0.0, trophies["sigma_g"])) if trophies["sigma_g"] > 0 else 1.0
     # (iv) Per-trophy parameters from their approximate posteriors.
@@ -791,22 +834,11 @@ def _scenario_rates(ctx: dict, variant: str, rng: random.Random, E_last: list[fl
         j_d = _logistic_pct(lj)
         # Cohort recursion from the fitted state along the scenario path.
         E = E_last[i]
-        P_now = segments[-1]["P"]
-        for m in range(len(points) - 1):
-            t0p, P0p = points[m]
-            t1p, P1p = points[m + 1]
-            dt = hours_between(t0p, t1p)
-            if dt <= 0:
-                continue
-            # Only the FUTURE part (after the last observed segment) moves;
-            # the past is already in E_last. Start from the last segment.
-            if t1p <= segments[-1]["start"]:
-                continue
-            # Interval [t0p, t1p] at P0p, then the jump to P1p.
-            E = (a_d / 100.0) * P0p + (E - (a_d / 100.0) * P0p) * math.exp(-k_d * dt)
-            E = E + (j_d / 100.0) * (P1p - P0p)
-            P_now = P1p
-        P_star = P_now if P_now > 0 else segments[-1]["P"]
+        a100 = a_d / 100.0
+        j100 = j_d / 100.0
+        for (dt, P0p, dP) in intervals:
+            E = a100 * P0p + (E - a100 * P0p) * math.exp(-k_d * dt)
+            E = E + j100 * dP
         R = 100.0 * E / P_star if P_star > 0 else 0.0
         # (v) Residual: decayed last residual + noise, on the logit scale.
         shift = decay * (res_last[i] if i < len(res_last) else 0.0)
@@ -920,26 +952,205 @@ def median_forecast(ctx: dict, variant: str) -> list[float]:
     rho = trophies["rho"]
     h = ctx["horizon_days"]
     decay = rho ** h if rho > 0 else 0.0
+    intervals = []
+    for m in range(len(points) - 1):
+        t0p, P0p = points[m]
+        t1p, P1p = points[m + 1]
+        if t1p <= segments[-1]["start"]:
+            continue
+        dt = hours_between(t0p, t1p)
+        if dt <= 0:
+            continue
+        intervals.append((dt, P0p, P1p - P0p))
+    P_star = points[-1][1] if points else segments[-1]["P"]
     out = []
     for i in range(n_tr):
         a, k, j = params[i]
         rates = _recursion_rates(a, k, j, r0s[i], segments)
         E = segments[-1]["P"] * rates[-1] / 100.0
-        P_now = segments[-1]["P"]
-        for m in range(len(points) - 1):
-            t0p, P0p = points[m]
-            t1p, P1p = points[m + 1]
-            dt = hours_between(t0p, t1p)
-            if dt <= 0 or t1p <= segments[-1]["start"]:
-                continue
-            E = (a / 100.0) * P0p + (E - (a / 100.0) * P0p) * math.exp(-k * dt)
-            E = E + (j / 100.0) * (P1p - P0p)
-            P_now = P1p
-        R = 100.0 * E / P_now if P_now > 0 else 0.0
+        a100 = a / 100.0
+        j100 = j / 100.0
+        for (dt, P0p, dP) in intervals:
+            E = a100 * P0p + (E - a100 * P0p) * math.exp(-k * dt)
+            E = E + j100 * dP
+        R = 100.0 * E / P_star if P_star > 0 else 0.0
         shift = decay * (res_last[i] if i < len(res_last) else 0.0)
         R = logistic(logit(R) + shift)
         out.append(round2_half_up(min(max(R, 0.0), 100.0)))
     return out
+
+
+# ---------------------------------------------------------------- Stage 4 ---
+# Leg A (rolling-origin) variant selection, lambda calibration, stress floor.
+#
+# Leg A is the ONLY in-program scoring leg. Origins are segment starts with
+# >=2 segments before them and >=1 day of history after them; the
+# pseudo-target is the segment start closest to origin + 36 h. The variant
+# is chosen by median absolute logit error of the deterministic median
+# forecast (cheap; the variants differ in their median, not in a shared
+# spread). Lambda is chosen by MEAN PINBALL-LOGIT over all five quantiles
+# (the calibration objective; 90% coverage is a diagnostic only) over the
+# grid [0.5..3]. With <2 origins there is no calibration: M0, lambda = 1.
+# The stress floor is three scenario groups (refresh faster than median;
+# refresh slower including NO refresh until target; player growth much
+# larger/smaller than projected); the final spread is
+# s_final = max(s_calibrated, s_stress) per trophy, re-centred on the
+# calibrated median. Cross-trophy residual correlation beyond the shared
+# shocks (g and t*) is NOT modelled — no claim otherwise is made.
+
+def pinball_logit(y: float, q: float, tau: float) -> float:
+    """Pinball loss on the logit scale (the competition metric)."""
+    ly = logit(max(min(y, 99.99), 0.01))
+    lq = logit(max(min(q, 99.99), 0.01))
+    return tau * (ly - lq) if ly >= lq else (1.0 - tau) * (lq - ly)
+
+
+def leg_a_origins(case: dict, segments: list[dict]):
+    """(origin_idx, target_idx) pairs: origin has >=2 segments before it
+    and a segment >=24 h after it; target is the segment closest to
+    origin + 36 h. At most MAX_ORIGINS, evenly spread (cost-bounded)."""
+    pairs = []
+    for o in range(2, len(segments)):
+        t_o = segments[o]["start"]
+        cands = [(abs(hours_between(t_o, segments[j]["start"]) - 36.0), j)
+                 for j in range(o + 1, len(segments))
+                 if hours_between(t_o, segments[j]["start"]) >= 24.0]
+        if not cands:
+            continue
+        cands.sort()
+        pairs.append((o, cands[0][1]))
+    if len(pairs) > MAX_ORIGINS:
+        idx = [round(i * (len(pairs) - 1) / (MAX_ORIGINS - 1))
+               for i in range(MAX_ORIGINS)]
+        pairs = [pairs[i] for i in sorted(set(idx))]
+    return pairs
+
+
+def _sub_case(case: dict, segments: list[dict], origin_idx: int, target_idx: int):
+    """The case as seen from an origin: history up to the origin segment,
+    checkpoint at the origin, pseudo-target at the later segment."""
+    t_origin = segments[origin_idx]["start"]
+    t_target = segments[target_idx]["start"]
+    hist = [r for r in case["history"]
+            if parse_time(r["at"]) <= t_origin]
+    sub = {"game": case["game"], "trophies": case["trophies"],
+           "levels": case["levels"], "history": hist,
+           "at": t_origin.strftime("%Y-%m-%dT%H:%M:%SZ"),
+           "target": t_target.strftime("%Y-%m-%dT%H:%M:%SZ"),
+           "horizon_minutes": int((t_target - t_origin).total_seconds() // 60)}
+    return sub, segments[target_idx]["rates"]
+
+
+def _origin_contexts(case: dict, segments: list[dict], origins):
+    """Build the (ctx, pseudo-target rates) pair for each origin once; the
+    context is variant-independent, so selection and calibration share it
+    instead of refitting per variant."""
+    out = []
+    for (o, t) in origins:
+        sub, y = _sub_case(case, segments, o, t)
+        segs = segment_history(sub)
+        if len(segs) < 2:
+            continue
+        out.append((build_context(sub, segs), y))
+    return out
+
+
+def select_variant(octxs):
+    """Winner by mean absolute logit error of the median forecast
+    (deterministic, cheap) over the prebuilt origin contexts.
+    Returns (variant, per-variant errors)."""
+    errs = {v: 0.0 for v in ("M0", "M1", "M2")}
+    cnts = {v: 0 for v in ("M0", "M1", "M2")}
+    for (ctx, y) in octxs:
+        for variant in ("M0", "M1", "M2"):
+            med = median_forecast(ctx, variant)
+            for i, yi in enumerate(y):
+                errs[variant] += abs(logit(max(med[i], 0.01)) - logit(max(min(yi, 99.99), 0.01)))
+                cnts[variant] += 1
+    for v in errs:
+        errs[v] = errs[v] / cnts[v] if cnts[v] else float("inf")
+    winner = min(("M0", "M1", "M2"), key=lambda v: (errs[v], v))
+    return winner, errs
+
+
+def calibrate_lambda(octxs, variant: str):
+    """Mean pinball-logit (all five quantiles, all trophies, all origins)
+    for each lambda on the grid; the winner minimises it. The quantiles are
+    scaled in logit space around the median (the median is unchanged)."""
+    scores = {lam: 0.0 for lam in LAMBDA_GRID}
+    cnt = 0
+    for (ctx, y) in octxs:
+        cols = run_scenarios(ctx, variant, N_BACKTEST, SEED)
+        fc = quantiles_from_scenarios(ctx, cols)
+        for i, yi in enumerate(y):
+            qs = fc["trophies"][i]["q"]
+            med_l = logit(max(min(qs[2], 99.99), 0.01))
+            for tau, q in zip(LEVELS, qs):
+                lq = logit(max(min(q, 99.99), 0.01))
+                for lam in LAMBDA_GRID:
+                    ql = logistic(med_l + lam * (lq - med_l))
+                    scores[lam] += pinball_logit(yi, ql, tau)
+                cnt += 1
+    if cnt == 0:
+        return 1.0, {}
+    mean = {lam: scores[lam] / cnt for lam in LAMBDA_GRID}
+    return min(LAMBDA_GRID, key=lambda lam: (mean[lam], lam)), mean
+
+
+def stress_halfwidths(ctx: dict, variant: str) -> list[float]:
+    """Per-trophy 90% half-width (logit) of the WORST stress run.
+    Stress groups: (S1) refresh faster than median (gaps x0.5);
+    (S2) refresh slower incl. NO refresh until target; (S3) player growth
+    much larger (x1.5) and much smaller (x0.5) than projected."""
+    n_tr = len(ctx["case"]["trophies"])
+    worst = [0.0] * n_tr
+    runs = [dict(gap_scale=0.5),
+            dict(force_no_refresh=True),
+            dict(adoption_scale=1.5),
+            dict(adoption_scale=0.5)]
+    for kw in runs:
+        cols = run_scenarios(ctx, variant, N_STRESS, SEED, **kw)
+        for i in range(n_tr):
+            vals = sorted(cols[i])
+            lo = _quantile(vals, 0.05)
+            hi = _quantile(vals, 0.95)
+            hw = (logit(max(hi, 0.01)) - logit(max(lo, 0.01))) / 2.0
+            worst[i] = max(worst[i], hw)
+    return worst
+
+
+def _scale_quantiles_logit(forecast: dict, lam: float) -> dict:
+    """Scale every quantile in logit space around the median."""
+    rows = []
+    for row in forecast["trophies"]:
+        med_l = logit(max(min(row["q"][2], 99.99), 0.01))
+        qs = []
+        for q in row["q"]:
+            lq = logit(max(min(q, 99.99), 0.01))
+            qs.append(round4(logistic(med_l + lam * (lq - med_l))))
+        rows.append({"id": row["id"], "q": qs})
+    return {"trophies": rows}
+
+
+def _apply_stress_floor(forecast: dict, s_stress: list[float]) -> dict:
+    """s_final = max(s_cal, s_stress) per trophy, re-centred on the median:
+    widen the quantiles proportionally (in logit) when the stress spread
+    exceeds the calibrated one; never narrow."""
+    rows = []
+    for k, row in enumerate(forecast["trophies"]):
+        qs = row["q"]
+        med_l = logit(max(min(qs[2], 99.99), 0.01))
+        lo_l = logit(max(min(qs[0], 99.99), 0.01))
+        hi_l = logit(max(min(qs[4], 99.99), 0.01))
+        s_cal = (hi_l - lo_l) / 2.0
+        s_fin = max(s_cal, s_stress[k])
+        factor = (s_fin / s_cal) if s_cal > 1e-9 else (1.0 if s_fin <= 1e-9 else 99.0)
+        out = []
+        for q in qs:
+            lq = logit(max(min(q, 99.99), 0.01))
+            out.append(round4(logistic(med_l + factor * (lq - med_l))))
+        rows.append({"id": row["id"], "q": out})
+    return {"trophies": rows}
 
 
 # ------------------------------------------------------- starter (fallback) ---
@@ -982,11 +1193,23 @@ def forecast_case(case: dict, name: str) -> dict:
 
 
 def model_forecast(case: dict, segments: list[dict], name: str) -> dict:
-    # Stage 3 lands here; Stage 4 (variant selection, calibration, stress
-    # floor) wraps this call. Until then: joint scenarios, M0, uncalibrated.
+    # Full pipeline: Leg A selection + lambda calibration (if >=2 origins),
+    # else M0 / lambda=1; joint scenarios; lambda scaling; stress floor.
+    # The per-origin contexts are built once and shared by selection and
+    # calibration (they are variant-independent).
     ctx = build_context(case, segments)
-    cols = run_scenarios(ctx, "M0", N_FINAL, SEED)
-    return quantiles_from_scenarios(ctx, cols)
+    origins = leg_a_origins(case, segments)
+    variant, lam = "M0", 1.0
+    if len(origins) >= 2:
+        octxs = _origin_contexts(case, segments, origins)
+        if len(octxs) >= 2:
+            variant, _errs = select_variant(octxs)
+            lam, _mean = calibrate_lambda(octxs, variant)
+    cols = run_scenarios(ctx, variant, N_FINAL, SEED)
+    fc = quantiles_from_scenarios(ctx, cols)
+    fc = _scale_quantiles_logit(fc, lam)
+    s_stress = stress_halfwidths(ctx, variant)
+    return _apply_stress_floor(fc, s_stress)
 
 
 def main() -> None:

@@ -286,10 +286,48 @@ def test_stage03():
     return True
 
 
+def test_stage04():
+    """Stage 4: Leg A selection + lambda calibration + stress floor, on the
+    model-truth long history (enough segments for >=2 origins)."""
+    print("== Stage 4: Leg A + lambda + stress floor ==")
+    case, segments, truth = _model_truth_case()
+    t_target = M.parse_time(case["at"]) + timedelta(days=4.5)
+    case["target"] = t_target.strftime("%Y-%m-%dT%H:%M:%SZ")
+    case["horizon_minutes"] = int(4.5 * 1440)
+    origins = M.leg_a_origins(case, segments)
+    print(f"  segments: {len(segments)}, Leg A origins: {origins}")
+    assert len(origins) >= 2, "need >=2 origins for calibration"
+    octxs = M._origin_contexts(case, segments, origins)
+    winner, errs = M.select_variant(octxs)
+    print(f"  variant errors (median |logit|): "
+          + ", ".join(f"{v}={errs[v]:.3f}" for v in ("M0", "M1", "M2"))
+          + f" -> winner {winner}")
+    lam, mean = M.calibrate_lambda(octxs, winner)
+    print(f"  lambda grid (mean pinball-logit): "
+          + ", ".join(f"{l}={mean[l]:.3f}" for l in M.LAMBDA_GRID)
+          + f" -> lambda {lam}")
+    t0 = time.time()
+    fc = M.model_forecast(case, segments, "stage4")
+    dt = time.time() - t0
+    print(f"  full pipeline in {dt:.2f}s; sample rows:")
+    for i in (0, 1, 2, 19):
+        print(f"    id{i+1}: q={fc['trophies'][i]['q']} (truth a={truth[i][0]:.2f} "
+              f"k={truth[i][1]} j={truth[i][2]})")
+    # Validity: 55 rows, q non-decreasing in [0,100].
+    assert len(fc["trophies"]) == 55
+    for row in fc["trophies"]:
+        qs = row["q"]
+        assert len(qs) == 5 and all(0.0 <= q <= 100.0 for q in qs)
+        assert all(qs[k] <= qs[k + 1] for k in range(4)), f"inverted quantiles {row}"
+    print("  Stage 4 OK")
+    return True
+
+
 def main():
     ok = test_stage01()
     ok = test_stage02() and ok
     ok = test_stage03() and ok
+    ok = test_stage04() and ok
     print("ALL STAGE TESTS PASSED" if ok else "FAILED")
     return 0 if ok else 1
 

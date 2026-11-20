@@ -16,9 +16,11 @@ Design (see DESIGN.md + EXPERIMENTS.md for the evidence and the deviations):
   Stage 3  joint predictive scenarios (fixed seed): one refresh path, one
            adoption draw and one shared progression shock per scenario;
            quantiles of the RATIO inside each scenario, never Q(E)/Q(P).
-  Stage 4  rolling-origin backtest (Leg A) + spread calibration lambda
-           (block bootstrap over origins) + Leg C stress floor:
-           final spread = max(s_calibrated, s_stress).
+  Stage 4  rolling-origin backtest (Leg A, dev only) + spread calibration
+           lambda (block bootstrap over origins). PRODUCTION IS LOCKED:
+           variant M0 + lambda 1.25, no stress floor (Ting finalization
+           20 Nov 2026; see model_forecast and EXPERIMENTS.md). The Leg A
+           machinery is kept for dev experiments, not run in production.
   Stage 5  deterministic output; fallback to the starter's persistence
            form whenever the history has < 2 segments or any fit fails.
 
@@ -983,6 +985,14 @@ def median_forecast(ctx: dict, variant: str) -> list[float]:
 # ---------------------------------------------------------------- Stage 4 ---
 # Leg A (rolling-origin) variant selection, lambda calibration, stress floor.
 #
+# DEV-ONLY machinery. Production (model_forecast) is LOCKED to M0 + lambda
+# 1.25 with no stress floor (Ting finalization, 20 Nov 2026): the runtime
+# re-selection evidence was 3 simulator origins with a 0.007 margin, too
+# weak to override the locked config, and the final spread check showed the
+# stress floor hurts mean pinball-logit on both Leg C seeds without
+# improving coverage. These functions remain for dev experiments
+# (tools/backtest.py, tools/final_spread_check.py).
+#
 # Leg A is the ONLY in-program scoring leg. Origins are segment starts with
 # >=2 segments before them and >=1 day of history after them; the
 # pseudo-target is the segment start closest to origin + 36 h. The variant
@@ -1193,23 +1203,23 @@ def forecast_case(case: dict, name: str) -> dict:
 
 
 def model_forecast(case: dict, segments: list[dict], name: str) -> dict:
-    # Full pipeline: Leg A selection + lambda calibration (if >=2 origins),
-    # else M0 / lambda=1; joint scenarios; lambda scaling; stress floor.
-    # The per-origin contexts are built once and shared by selection and
-    # calibration (they are variant-independent).
+    # Full pipeline, LOCKED configuration (Ting finalization, 20 Nov 2026):
+    # variant M0 (population shrinkage) + lambda 1.25, NO stress floor.
+    # The runtime Leg A re-selection is disabled: its evidence was 3
+    # simulator origins with a 0.007 margin (M1 0.308 vs M0 0.315), too weak
+    # to override the locked config on the real final case. The Leg A
+    # machinery (select_variant / calibrate_lambda) is kept for dev
+    # experiments (tools/backtest.py) but is not run in production.
+    # The stress floor was dropped by the final spread check
+    # (tools/final_spread_check.py, Leg C seeds 7+11): it widened only 1/55
+    # trophies, hurt mean pinball-logit on both seeds (0.2193->0.2216;
+    # 0.2238->0.2261) and did not improve coverage (0.82->0.82; 0.67->0.67),
+    # so the wider spread was NOT picked (pinball decides, coverage is
+    # diagnostic). stress_halfwidths is kept for dev/stress analysis.
     ctx = build_context(case, segments)
-    origins = leg_a_origins(case, segments)
-    variant, lam = "M0", 1.0
-    if len(origins) >= 2:
-        octxs = _origin_contexts(case, segments, origins)
-        if len(octxs) >= 2:
-            variant, _errs = select_variant(octxs)
-            lam, _mean = calibrate_lambda(octxs, variant)
-    cols = run_scenarios(ctx, variant, N_FINAL, SEED)
+    cols = run_scenarios(ctx, "M0", N_FINAL, SEED)
     fc = quantiles_from_scenarios(ctx, cols)
-    fc = _scale_quantiles_logit(fc, lam)
-    s_stress = stress_halfwidths(ctx, variant)
-    return _apply_stress_floor(fc, s_stress)
+    return _scale_quantiles_logit(fc, 1.25)
 
 
 def main() -> None:

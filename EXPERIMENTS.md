@@ -214,3 +214,122 @@ target, player growth x1.5, player growth x0.5.
   the final case arrives. Do not claim otherwise.
 - **Runtime:** ~2.4 s on a 20-segment 4.5-day case (limit 8 s). Deterministic
   (two runs byte-identical). Format valid (harness PASS on p00/p01).
+
+---
+
+## CHALLENGER — Trophy Lane (branch `challenger-trophy-lane`, 2026-11-20)
+
+A second entry built from the standalone Trophy Lane prompt (user-supplied),
+as a challenger to the submitted M0 entry (commit 2e30e66, main). The
+challenger is a FRESH `main.py` written from the prompt spec alone (the
+submitted main.py was never read). No bundle, check, or submit was done
+from this branch.
+
+### Frozen path (practice) — proven core, UNCHANGED
+
+- Gate: all four §5 conditions, strictly (history fully frozen on
+  (players_tracked, rates); target 04:30Z/05:00Z 2026-11-19; ids 1..55;
+  players_tracked 638). Anything else falls through to the rich path.
+- Median = §4 page rate exactly per trophy; σ = 0.003; id 2 all five
+  quantiles exactly 100.0; non-decreasing enforced by nextafter nudging.
+- Result (kit p00/p01, scored vs §4 page rates as truth, §1 pinball):
+  **loss 0.000591 on both p00 and p01**, median |q50 − y| 0.0000pp,
+  coverage90 1.000. Target ≈0.00059 hit exactly.
+- Harness PASS: format valid, 55 rows, q non-decreasing in [0,100],
+  ≤65,536 B, two runs byte-identical. Runtime 0.05 s for both cases.
+
+### Rich path (final) — design as specified, plus documented choices
+
+The prompt leaves four pieces unspecified; the choices made (all recorded
+here, all inside main.py):
+- **Time origin for Theil–Sen:** t = hours since the first read in the
+  last-24h window; x = log(1 + t/τ); target x from the same origin.
+- **Level-band prior:** the prior slope for a band is the MEDIAN raw
+  Theil–Sen slope of the trophies in that band in the same fit
+  (fallback: overall median slope, then 0.0). Bands by last rate:
+  <1%, 1–10%, ≥10%.
+- **Damped median:** logit(median) = logit(last) + damping × (full
+  trend extrapolation − logit(last)), full = shrunk intercept + shrunk
+  slope × target_x, intercept recomputed for the shrunk slope.
+- **infl:** min(1.25, 1.0 + 0.05·H/24), H = horizon in hours
+  (1.225 at the 4.5-day final horizon).
+- τ and mult are chosen per case by rolling-origin backtest (up to 5
+  origins in the last 72h, ≥12 reads before each; fit on the 24h before
+  the origin, score the read 6h later; full 5-level pinball).
+- 100% trophy (last rate ≥ 99.99): median 99.99, σ = 0.3, bypassing
+  trend and rails. No shared parameters or σ between the two paths.
+  No rounding to 2 decimals. Stdlib only, no network, deterministic.
+
+### What differs from the prompt spec (bos: differentiate from the rank-4
+### entry that uses this design) — and why
+
+The frozen path is byte-for-byte the proven design (page-rate medians,
+σ = 0.003, strict gate) — that part is NOT differentiated, it is what
+makes the 0.00059. The rich-path knobs were varied on Leg C and the
+winners shipped:
+
+| knob | prompt spec | shipped | Leg C evidence |
+|---|---|---|---|
+| damping | 0.4 | **1.0** | sweep: 0.3→0.1587, 0.4→0.1536, 0.5→0.1457, 0.6→0.1401, 0.7→0.1357, 1.0→0.1337 (prior 5, seeds 7+11). Monotone: the trend signal is real and persists over 4.5 d; damping only under-shoots it. |
+| prior weight | 10 | **2** | sweep: at damping 1.0, prior 2→0.1327, 5→0.1337, 10→0.1351, 20→0.1340 (seeds 7+11). Heavy shrinkage drags the slope toward 0 for no gain. |
+| τ grid | {6,12,24,48} | **unchanged** | every grid tried ({6,12,24,48}, {12,24,48}, {6,12,24}, {24,48}) scores IDENTICALLY (0.1327, seeds 7+11): τ is inert here — the backtest picks equivalently and the fit is near τ-invariant. No differentiation needed. |
+| mult grid | {0.75,1.0,1.5} | **{0.5,0.75,1.0,1.5}** | {0.75,1.0,1.5}→0.1327, {0.5,0.75,1.0}→0.1013, {0.5,0.75,1.0,1.5}→0.1013 (seeds 7+11). The backtest picks the tightest spread the case's own history justifies; 1.5 stays as the safety valve for a noisy real final. |
+| mult 0.25/0.35 | — | **REJECTED** | {0.35,0.5,0.75}→0.0859, {0.25,0.35,0.5}→0.0849 — better on the simulator, but they ride the σ clip floor (0.25) and are pure simulator overfitting: the model-truth simulator is perfectly smooth, so the tightest allowed spread always wins. The real final has refresh jumps; a σ of 0.25 would be punished hard. Not shipped. |
+
+### Variant sweep (Leg C, seeds 7+11, mean pinball-logit)
+
+damping × prior weight (spec τ/mult grids):
+
+| damping | prior 2 | prior 5 | prior 10 | prior 20 |
+|---|---|---|---|---|
+| 0.3 | 0.1580 | 0.1587 | 0.1598 | 0.1615 |
+| 0.4 | 0.1512 | 0.1522 | 0.1536 | 0.1558 |
+| 0.5 | 0.1446 | 0.1457 | 0.1474 | 0.1502 |
+| 0.6 | 0.1392 | 0.1401 | 0.1417 | 0.1447 |
+| 0.7 | 0.1348 | 0.1357 | 0.1371 | 0.1398 |
+| 1.0 | **0.1327** | 0.1337 | 0.1351 | 0.1340 |
+
+(First sweep run was void: identical 0.1520/0.1552 across all 9 cells —
+`_rich_forecast` binds damping/prior as def-time defaults, so the
+monkey-patched module constants never reached it. Fixed in
+tools/compare_challenger.py by passing the knobs explicitly; the second
+sweep above is the valid one.)
+
+### Final head-to-head (Leg C, 4.5-day horizon, identical cases, seeds 7/11/13/23/29)
+
+| seed | challenger shipped | M0 | persistence |
+|---|---|---|---|
+| 7 | 0.0996 | 0.2193 | 0.1705 |
+| 11 | 0.1031 | 0.2238 | 0.1744 |
+| 13 | 0.0987 | 0.2213 | 0.1461 |
+| 23 | 0.1011 | 0.3089 | 0.1685 |
+| 29 | 0.0987 | 0.2445 | 0.1654 |
+| **mean** | **0.1002** | **0.2435** | **0.1650** |
+
+- Challenger shipped (damping 1.0, prior 2, mult {0.5,0.75,1.0,1.5}):
+  mean **0.1002**, wins on ALL 5 seeds, per-seed range 0.0987–0.1031
+  (tight — the challenger is stable across seeds).
+- Spec/friend config (damping 0.4, prior 10, mult {0.75,1.0,1.5}):
+  mean 0.1493 on the same seeds — the shipped knobs beat the spec
+  config by 0.0491.
+- M0 mean 0.2435 (seed 7 reproduces the verified 0.2193 exactly, which
+  cross-validates this Leg C replication against the M0 build's setup).
+  M0 varies widely by seed (0.2193–0.3089); persistence (last rate,
+  σ=0.5) beats M0 on every seed here (mean 0.1650).
+- Challenger runtime ~1.2 s/case on the Leg C case (limit 8 s);
+  CLI end-to-end on shipped defaults reproduces the sweep exactly
+  (seed 7: 0.0996, 1.27 s, byte-identical second run).
+
+### Verdict
+
+**The challenger beats M0 for the final on every Leg C seed
+(0.1002 vs 0.2435 mean), and beats the spec/friend config (0.1493).**
+Caveats, stated plainly: Leg C is a model-truth simulator, not the real
+final — the real history will have refresh jumps and noise the simulator
+lacks, so the real-final gap will be smaller than 0.14 and is not
+guaranteed. What IS established: on the only ground where both programs
+can run head-to-head at the final horizon, the challenger wins on all 5
+seeds with a much tighter spread of outcomes. The frozen-path practice
+score (0.000591) is unchanged and proven. No bundle, check, or submit
+was done from this branch; the shipped knobs live in main.py on
+`challenger-trophy-lane` only — main is untouched at 2e30e66.

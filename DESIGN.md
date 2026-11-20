@@ -34,6 +34,31 @@ data/live-snapshot-2026-11-20.json (live Exophase crawl 2026-11-20 09:07 UTC).
    practice must NOT select the model: its history is frozen and its loss is
    dominated by a single refresh event.
 
+## 0.1 Correction after Ting's audit (20 Nov 2026) — P0, the rate equation
+
+Ting's audit found a mathematical bug in the Stage 2 draft above: it modelled
+the RATE directly as r_i(t) = a_i(1 - exp(-k_i(t - t0))) and then set
+E_i = P(t*) * r_i(t*), so R_i = 100 * E_i / P(t*) = 100 * r_i(t*) and P(t)
+cancelled out entirely — player growth 10x faster or slower could not move
+the predicted rate, and the claim "fast growth -> younger base -> more
+diluted rate" did not happen in the equations as written. The model below
+was therefore NOT substantively a joint earners/players forecast.
+
+The fix (Stage 2, rewritten): forecast EARNERS E_i(t*) directly, with a
+cohort decomposition — (a) the initial tracked cohort earning trophies over
+time, (b) new players entering the tracked population, each arriving with a
+trophy already earned with probability j_i, and then progressing like
+incumbents. R_i = 100 * E_i / P is computed per scenario, and P now moves
+the rate materially (proved by the ablation test in EXPERIMENTS.md: change
+the P growth rate and the predicted rate must move). Where the data cannot
+identify new-cohort behaviour, the assumption used is stated and its
+uncertainty documented, not hidden. Two further P1 corrections ride with it:
+the calibration objective is the mean pinball-logit over all five quantiles
+(90% coverage is a diagnostic only, never the selector), and Leg B is
+strictly diagnostic (see Stage 4). The exposure-clock variant tried during
+prototyping (a rate curve in X(t) = integral of P / P) is superseded by this
+cohort model and is not in the shipped program.
+
 ## 1. Facts the design must respect
 
 - Practice history is FROZEN (ANALYSIS.md): 638 players, 943 trophies earned,
@@ -101,41 +126,76 @@ checkpoint — the rates are then the checkpoint's rates, and the scenarios
 must include that branch (it is a real possibility, not an edge case to
 ignore).
 
-### Stage 2 — Trophy model: earners growth + saturation, hierarchical
+### Stage 2 — Trophy model: earners by cohort (CORRECTED 20 Nov, see §0.1)
 
-For trophy i, model its rate as a saturating curve in clock time since
-release:
+Forecast EARNERS E_i(t) directly — never P(t) times a rate. The rate is
+R_i(t) = 100 * E_i(t) / P(t), computed per scenario from the simulated
+earners and players, so player growth moves the rate: fast growth adds many
+new players (who mostly do not have the trophy yet) and pulls the rate
+toward the joiner rate; slow growth lets incumbents dominate and pulls the
+rate toward the trophy's asymptote. The decomposition, per trophy i:
 
-    r_i(t) = a_i * (1 - exp(-k_i * max(0, t - t0))),  t0 = release
+  (a) Initial cohort. The P0 players tracked at the first segment hold
+      E_i(t_first) = P0 * r0_i earners, r0_i their rate then. They earn
+      further trophies over time toward the asymptote a_i at speed k_i:
+      their earners at time t are P0 * F_i(t) with
+          F_i(t) = a_i - (a_i - r0_i) * exp(-k_i * (t - t_first)).
+  (b) Joiner cohorts. When ΔP new players are tracked at a refresh, each
+      arrives already holding trophy i with probability j_i (the joiner
+      rate: they played before syncing, or earned it in their first
+      session). Afterwards they progress like incumbents, toward the same
+      asymptote a_i at the same speed k_i.
 
-with per-trophy asymptote a_i in (0, 1] and speed k_i > 0, fit by least
-squares on the logit scale over the trophy's segment rates. The fit is
-HIERARCHICAL (partial pooling): log k_i and logit a_i are shrunk toward the
-population means estimated from all 55 trophies, with the shrinkage
-strength chosen by the backtest (§4). The shared population curve is the
-mean trajectory; each trophy keeps its own parameters. One curve for all
-trophies is explicitly rejected: the live snapshot shows per-trophy speeds
-differ by ~10x (chapter 1 at 7.99% vs chapter 2 at 0.90% vs most trophies at
-0.01–0.02%), and a single curve would be badly wrong for all of them.
+  Both parts are one discrete recursion over refresh intervals. Over an
+  interval of length Δt with the tracked count constant at P, earners evolve
+  toward a_i * P:
+      E' = a_i * P + (E - a_i * P) * exp(-k_i * Δt).
+  At the refresh that ends the interval, ΔP joiners arrive:
+      E'' = E' + j_i * ΔP.
+  The rate at the new segment is R = 100 * E'' / P_new. At the first segment
+  the rate is r0_i by construction. The recursion is exact for the
+  step-function P the page shows (frozen between refreshes, jumping at
+  refreshes), and it is the same recursion in the fit and in the scenarios.
 
-- NO name-based priors. The fit uses only (segment time, rate) pairs.
+  Per-trophy parameters are (a_i, k_i, j_i): asymptote a_i in (0, 1], speed
+  k_i > 0, joiner rate j_i in [0, 1]. They are fit by least squares on the
+  logit scale over the trophy's segment rates (rates = E_i / P at segment
+  starts), with the 2-decimal rounding carried as censored intervals exactly
+  as the design already specified for the rate fit. The fit is HIERARCHICAL
+  (partial pooling): log k_i, logit a_i and logit j_i are shrunk toward the
+  population means (M0), the tier-group means (M1), or the tier means pulled
+  back to the population mean (M2); the shrinkage strength is empirical
+  Bayes from the fit variances, and the winner among M0/M1/M2 is chosen by
+  rolling-origin validation (Stage 4). Where the history cannot identify
+  j_i (too few refreshes to see joiners arrive), its standard error is
+  large and shrinkage pulls it to the population joiner rate — the
+  assumption is then explicit in the shrinkage, not hidden in a constant.
+  A simple testable assumption is used where the data is thin, and its
+  uncertainty is documented (EXPERIMENTS.md), never presented as if player
+  growth were fully modelled.
+
+- NO name-based priors. The fit uses only (segment time, P, rate) triples.
   Trophy names, descriptions, secret flags and tiers are NOT inputs to the
-  fit. In particular, nothing is hardcoded like "early-chapter trophies
-  saturate fast" from a name; if chapter 1 saturates fast, the fit must
-  discover it from its own rate history. Shrinkage is toward the single
-  population mean, not toward tier/name groups, for the same reason.
+  fit, except tier as the shrinkage group in M1/M2 (a field of the case,
+  not a name or a chapter guess). In particular, nothing is hardcoded like
+  "early-chapter trophies saturate fast" from a name; if chapter 1 saturates
+  fast, the fit must discover it from its own rate history. Shrinkage is
+  toward the single population mean (M0), the tier mean (M1) or the
+  hierarchically pooled tier mean (M2), for the same reason.
 - Residual correction. Each trophy's residual at the last segment (logit
   scale, observed minus fitted) is carried forward with decay rho^h, where
   h is the horizon in days and rho in [0, 1] is fit from segment-to-segment
   residual persistence. If residuals show no persistence, rho -> 0 and the
   correction vanishes. This handles trophies that sit systematically above
   or below their curve.
-- The 100% trophy (id 2). Its fitted curve has a_i ~= 1: new players earn
-  it almost immediately, so E_2(t) ~= P(t) in every scenario and its rate
-  stays ~= 100%, with a narrow lower tail from scenarios where a refresh
-  lands just before the target on a wave of brand-new players. It is NOT
-  special-cased or pinned; the fit handles it. (logit(100) is handled by
-  the same clamp to 99.99 the starter uses.)
+- The 100% trophy (id 2). Its fitted curve has a_i ~= 1 and j_i ~= 1: new
+  players earn it almost immediately, so E_2(t) ~= P(t) in every scenario
+  and its rate stays ~= 100%, with a narrow lower tail from scenarios where
+  a refresh lands just before the target on a wave of brand-new players. It
+  is NOT special-cased or pinned; the fit handles it, with the feasibility
+  projection (a shrunk curve must still respect every observed rounding
+  interval) as the backstop. (logit(100) is handled by the same clamp to
+  99.99 the starter uses.)
 - Earners are integers; the scenario math uses E_i = P * r_i and keeps the
   rounding interval as noise. The output quantiles are percents; fractions
   are allowed.
@@ -155,14 +215,19 @@ tune so the whole run stays < ~5 s on 1 CPU — see §5). One scenario draws:
         on g;
   (v)   per-trophy residual draws with the fitted decay.
 
-Then E_{i} = P(t*) * r_i(t*) and the scenario rate is
-R_i = 100 * E_i / P(t*). The P cancels algebraically inside a scenario,
-but the JOINTNESS is real and is the whole point: t* is shared (a late
-refresh raises all rates together, an early one lowers them), g is shared
-(players progress faster/slower than expected across the board), and the
-rate depends on the player-growth path (fast growth = young player base =
-dilution), not on the clock alone. Simulating E and P marginally and
-dividing their quantiles would erase exactly these couplings.
+Then E_{i} is the earner count from the Stage 2 cohort recursion run along
+the scenario's refresh path and player path, and the scenario rate is
+R_i = 100 * E_i / P(t*). P does NOT cancel here: the recursion's joiner
+terms (j_i * ΔP at every refresh) and its incumbent evolution both depend
+on the player path, so a scenario with fast player growth ends with a lower
+rate for slow trophies and a higher one for fast trophies than a scenario
+with slow growth, exactly as dilution demands. The JOINTNESS is the whole
+point: t* is shared (a late refresh raises all rates together, an early one
+lowers them), g is shared (players progress faster/slower than expected
+across the board), and the rate depends on the player-growth path (fast
+growth = young player base = dilution), not on the clock alone. Simulating
+E and P marginally and dividing their quantiles would erase exactly these
+couplings.
 
 Quantiles: for each trophy, the empirical tau-quantiles of {R_i} over the
 scenarios, at tau in {0.05, 0.25, 0.5, 0.75, 0.95}. Empirical quantiles
@@ -191,17 +256,20 @@ three legs, and the design says plainly which leg each claim rests on:
   (adoption form log-time vs linear; refresh gaps lognormal vs empirical;
   residual decay on/off) is by mean pinball-logit over Leg A origins.
 
-  Leg B (real, one point, design-time) — origin = practice last read
-  (2026-11-19T02:30:00Z, P = 638), pseudo-target = live snapshot
-  (2026-11-20T09:07:00Z, ~30.6 h later). The 55 live rates ARE the answer
-  for that pseudo-target, so it scores with pinball-logit on rates (players
-  not needed for scoring). Caveats, stated in the snapshot file: the
-  snapshot is a single crawl, not a house read; its refresh-as-of time is
-  fuzzy (the page's last refresh before the crawl is unknown); players
+  Leg B (real, one point, design-time, STRICTLY DIAGNOSTIC) — origin =
+  practice last read (2026-11-19T02:30:00Z, P = 638), pseudo-target = live
+  snapshot (2026-11-20T09:07:00Z, ~30.6 h later). The 55 live rates ARE the
+  answer for that pseudo-target, so it scores with pinball-logit on rates
+  (players not needed for scoring). Caveats, stated in the snapshot file:
+  the snapshot is a single crawl, not a house read; its refresh-as-of time
+  is fuzzy (the page's last refresh before the crawl is unknown); players
   unknown (only the >80k bound). It is the only real long-horizon point
   available before the deadline and the only direct test of the dilution
-  regime. It is reported as ONE point with a fuzzy target, used as a
-  tiebreak/check on Leg A — never as the sole selector.
+  regime. It is reported as ONE diagnostic point with a fuzzy target. It is
+  NOT a scored backtest point, it is NOT used to select hyperparameters or
+  to choose among M0/M1/M2, and its numbers are NEVER used to claim model
+  performance. It exists so a human can look at whether the model is in
+  the right regime at all — nothing more.
 
   Leg C (synthetic) — a refresh simulator calibrated on the observed
   refreshes (gap distribution and adoption curve fit from the history at
@@ -215,18 +283,23 @@ three legs, and the design says plainly which leg each claim rests on:
   simulator-conditional, never as real-world evidence.
 
 Calibration. From backtest residuals (per origin, per trophy: whether y
-fell below q_tau for each tau, and the logit residuals), compute the
-empirical coverage of the 90% band (q05 <= y <= q95) with a BLOCK BOOTSTRAP
-over origins — resample whole origins, never individual trophy-items,
-because trophies share the refresh shock and origins share time. Choose a
-single global spread multiplier lambda (applied to the scenario spread on
-the logit scale, widening/narrowing all quantiles around the median) that
-brings block-bootstrap coverage to ~0.90 on the backtest; if coverage
-differs systematically by horizon, use lambda(h) linear in log-horizon,
-fit on the backtest. Lambda is FIT at runtime from the backtest, not a
-hardcoded constant, and is bounded (e.g. [0.5, 3]) so a degenerate backtest
-cannot produce an absurd band. If the backtest has < 2 usable origins,
-lambda = 1 (uncalibrated scenario spread) and the program records that.
+fell below q_tau for each tau, and the logit residuals), choose a single
+global spread multiplier lambda (applied to the scenario spread on the
+logit scale, widening/narrowing all quantiles around the median) that
+minimises the MEAN PINBALL-LOGIT over all five quantiles on the backtest
+origins — that mean pinball is the calibration objective, because it is the
+scored metric. The 90% coverage of the band (q05 <= y <= q95) is reported
+as a DIAGNOSTIC only (target ~0.90), with a BLOCK BOOTSTRAP over origins —
+resample whole origins, never individual trophy-items, because trophies
+share the refresh shock and origins share time — and it never selects
+lambda on its own. If one global lambda is not enough (the pinball by
+horizon shows a systematic pattern), compare it with lambda(h) linear in
+log-horizon, fit on the backtest; never five separate multipliers, one per
+quantile (that is overfitting the scored levels). Lambda is FIT at runtime
+from the backtest, not a hardcoded constant, and is bounded (e.g. [0.5, 3])
+so a degenerate backtest cannot produce an absurd band. If the backtest
+has < 2 usable origins, lambda = 1 (uncalibrated scenario spread) and the
+program records that.
 
 What the backtest can and cannot prove. It CAN prove the forecaster beats
 persistence on refresh events and that its 90% band covers ~90% on the
@@ -292,10 +365,15 @@ simulator, not the world.
 5. Trophy list is fixed at f00's 55. If Exophase adds/removes trophies
    before the target, the answer read must still list all 55 (per RULES,
    else there is no answer and no prize is paid).
-6. Cross-trophy correlation beyond the shared shocks (t*, g) is not
-   modelled: per-trophy residuals are independent conditional on the
+6. Cross-trophy residual correlation beyond the shared shocks (t*, g) is
+   NOT modelled: per-trophy residuals are independent conditional on the
    shared shocks. The block bootstrap accounts for that correlation in
-   calibration uncertainty, not in the point forecast.
+   calibration uncertainty, not in the point forecast. Do not claim the
+   model represents the full cross-trophy correlation: two trophies that
+   move together for a reason other than a shared refresh or a shared
+   progression shock (e.g. the same mission gating both) are treated as
+   independent, and their joint quantiles are therefore too narrow. This
+   is a documented limitation, not a hidden one.
 7. The model does not know WHY a refresh happens (Exophase's internal
    triggers) and does not model player churn in the tracked set (players
    whose profiles stop syncing). Both are second-order against the
@@ -307,9 +385,12 @@ simulator, not the world.
   synthetic f00-like history (many reads, several refreshes) built by the
   Leg C simulator.
 - Backtest report (dev-only script, not shipped in main.py): Leg A mean
-  pinball-logit per horizon + per variant, Leg B single-point score on the
-  live snapshot, Leg C 4.5-day score; block-bootstrap 90% coverage before
-  and after lambda calibration (target ~0.90).
+  pinball-logit per horizon + per variant, Leg B single-point diagnostic
+  (reported, never used for selection), Leg C 4.5-day score; mean
+  pinball-logit before and after lambda calibration (the calibration
+  objective) plus the 90% coverage as a diagnostic (target ~0.90);
+  ablation test proving the predicted rate moves when the P growth rate
+  changes (if it does not move, the model is still wrong).
 - Timing: main.py < 5 s on p00/p01 and on the synthetic long history,
   1 CPU.
 - No network/clock calls in main.py (grep for socket/urllib/time/datetime

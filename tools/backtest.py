@@ -134,14 +134,60 @@ def test_stage01():
     times = M.simulate_refresh_times(rng, gaps, segments[-1]["start"], at,
                                      at + timedelta(days=4.5))
     print(f"  simulated refreshes to target+4.5d: {len(times)} (first {times[0] if times else None})")
-    x = M.exposure_at(segments, segments[-1]["start"])
-    print(f"  exposure X at last segment start: {x:.2f} h")
     print("  Stage 0-1 OK")
+    return True
+
+
+def test_stage02():
+    """Stage 2: trophy curves + M0/M1/M2 shrinkage on the synthetic history."""
+    print("== Stage 2: trophy curves + shrinkage ==")
+    p00 = load_case(KIT / "input" / "p00.in")
+    trophies = p00["trophies"]
+    base = p00["history"][-1]["rates"]
+    t0 = datetime(2026, 11, 18, 23, 50, tzinfo=timezone.utc)
+    segs = []
+    for k, (dh, P, mult_slow, fast) in enumerate([
+            (0, 638, 1.0, 1.0),
+            (5, 3868, 0.17, 1.3),
+            (12, 20000, 0.05, 2.0),
+            (30, 90000, 0.015, 3.0)]):
+        rates = []
+        for i, r in enumerate(base):
+            if r >= 99.99:
+                rates.append(100.0)
+            elif i in (2, 19):
+                rates.append(round(min(99.99, r * fast), 2))
+            else:
+                rates.append(round(max(0.01, r * mult_slow), 2))
+        segs.append((t0 + timedelta(hours=dh), P, rates))
+    at = t0 + timedelta(hours=36)
+    case = make_synthetic_case(segs, at, 90, at + timedelta(minutes=90), trophies)
+    segments = M.segment_history(case)
+    fit = M.fit_trophy_curves(case, segments)
+    print(f"  rho={fit['rho']:.3f} sigma_res={fit['sigma_res']:.3f} sigma_g={fit['sigma_g']:.3f}")
+    for name in ("M0", "M1", "M2"):
+        p = fit["variants"][name]
+        print(f"  {name}: id1 plat a={p[0][0]:.4f} k={p[0][1]:.4f} j={p[0][2]:.4f} | "
+              f"id2 100% a={p[1][0]:.4f} k={p[1][1]:.4f} j={p[1][2]:.4f} | "
+              f"id3 fast a={p[2][0]:.3f} k={p[2][1]:.3f} j={p[2][2]:.3f} | "
+              f"id20 fast a={p[19][0]:.3f} k={p[19][1]:.3f} j={p[19][2]:.3f} | "
+              f"id5 slow a={p[4][0]:.4f} k={p[4][1]:.4f} j={p[4][2]:.4f}")
+        # The 100% trophy must stay ~100% in every variant (feasibility).
+        assert p[1][0] > 99.9 and p[1][2] > 90, f"{name}: id2 collapsed to a={p[1][0]} j={p[1][2]}"
+    # The fitted curves must reproduce the observed segment rates (censored).
+    for name in ("M0",):
+        for i in (0, 2, 19):
+            a, k, j = fit["variants"][name][i]
+            rates = M._recursion_rates(a, k, j, fit["r0"][i], segments)
+            obs = [seg["rates"][i] for seg in segments]
+            print(f"  {name} id{i+1}: fitted={[round(r, 2) for r in rates]} observed={obs}")
+    print("  Stage 2 OK")
     return True
 
 
 def main():
     ok = test_stage01()
+    ok = test_stage02() and ok
     print("ALL STAGE TESTS PASSED" if ok else "FAILED")
     return 0 if ok else 1
 

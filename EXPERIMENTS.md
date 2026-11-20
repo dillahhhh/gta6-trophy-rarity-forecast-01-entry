@@ -528,3 +528,115 @@ persistence (Test 2 refresh-slow) — but it would still be no worse
 than the submitted M0 there. The resubmit strictly dominates keeping
 M0 on every comparison available (45/45 vs M0 across Tests 1–2).
 No bundle, check, or submit was done from this branch.
+
+## REVISI #2 — Ting's verdict on the eb82928 tuner (2026-11-20, 19:45 WIB)
+
+Ting WITHDREW the GO resubmit for eb82928 after the pre-submit check:
+on the 48h-history f00-shaped input the horizon-corrected tuner picked
+tau=6 / mult=1.5 — pinball **0.3050, WORSE than M0 (0.3003)** — while
+fixed 0.75 scored **0.2433** on the same input. Structural cause: 48h
+history has ZERO origins with >= 24h before + >= 24h after, so the
+backtest could only score horizons <= ~42h and its choice was applied
+to a 108.5h forecast — P0 recurring on short history. Ting's fix:
+**pin the spread multiplier to FIXED 0.75; the tuner must not choose
+it at all** (removing 1.5 from the grid alone is NOT enough). Damping
+0.4 / prior 10 / tau grid {6,12,24,48} / frozen path unchanged.
+Branch: `challenger-fixed075`, from eb82928.
+
+### What changed (main.py, branch only — challenger-trophy-lane and main untouched)
+
+- New constant `RICH_MULT_FIXED = 0.75`.
+- `_backtest_choose` now chooses TAU ONLY: each tau is scored at the
+  fixed multiplier and the function returns `(best_tau, 0.75)`.
+  All `(12, 1.0)` fallbacks became `(12, RICH_MULT_FIXED)`.
+- `RICH_MULT_GRID` kept as a legacy constant (the old-6h diagnostic
+  in revision_tests.py still references it) but production never
+  selects from it. Docstring + header comment updated.
+- Nothing else changed: damping, prior, tau grid, cohort model,
+  frozen path, `_forecast_window`, `_forecast_one` untouched.
+
+### Test 1 — Leg C head-to-head, SAME 5 seeds (fixed075_tests.py)
+
+| seed | B075 cons+0.75 | B100 cons+1.00 | A075 aggr+0.75 | M0 | persistence | tuner (tau, mult) |
+|---|---|---|---|---|---|---|
+| 7 | 0.1579 | 0.1855 | 0.1470 | 0.2193 | 0.1705 | (24, 0.75) |
+| 11 | 0.1663 | 0.1915 | 0.1419 | 0.2238 | 0.1744 | (12, 0.75) |
+| 13 | 0.1388 | 0.1722 | 0.1364 | 0.2213 | 0.1461 | (48, 0.75) |
+| 23 | 0.1612 | 0.1882 | 0.1469 | 0.3089 | 0.1685 | (12, 0.75) |
+| 29 | 0.1549 | 0.1840 | 0.1452 | 0.2445 | 0.1654 | (24, 0.75) |
+| MEAN | **0.1558** | 0.1843 | 0.1435 | 0.2435 | 0.1650 | mult 0.75 everywhere |
+
+B075 beats M0 on **5/5 seeds** (mean margin −0.0877), beats fixed 1.0
+by −0.0285 and persistence by −0.0092. Fixed 0.75 is also slightly
+better than the old tuner-B (0.1609). A075 still wins on the simulator
+(the known model-truth overfit caveat — aggressive was never approved).
+
+### Test 2 — Leg C with refresh misspecification (9 scenarios × 5 seeds)
+
+| scenario | B075 | B100 | M0 | persistence | B075−M0 | B075−P |
+|---|---|---|---|---|---|---|
+| base | 0.1558 | 0.1843 | 0.2435 | 0.1650 | −0.0877 | −0.0092 |
+| refresh-fast-3h | 0.1322 | 0.1680 | 0.1977 | 0.1333 | −0.0655 | −0.0011 |
+| refresh-slow-12h | 0.1734 | 0.2009 | 0.2699 | 0.1770 | −0.0964 | −0.0035 |
+| jump-up-x1.5 | 0.1512 | 0.1812 | 0.2629 | 0.1531 | −0.1117 | −0.0019 |
+| jump-down-x0.6 | 0.1585 | 0.1853 | 0.3118 | 0.1745 | −0.1533 | −0.0160 |
+| no-refresh-24h | 0.2039 | 0.2314 | 0.2899 | 0.1953 | −0.0860 | +0.0086 |
+| growth-fast-x1.5 | 0.1494 | 0.1804 | 0.2632 | 0.1726 | −0.1138 | −0.0231 |
+| growth-slow-x0.5 | 0.1468 | 0.1788 | 0.1926 | 0.1458 | −0.0458 | +0.0010 |
+| read-noise-0.05pp | 0.1632 | 0.1927 | 0.3492 | 0.1700 | −0.1859 | −0.0068 |
+
+B075 beats M0 in **9/9** scenarios and persistence in **7/9**.
+EXPLICIT refresh-slow-12h (Ting: not hidden in the mean): B075 0.1734
+vs persistence 0.1770 (−0.0035) and vs M0 −0.0964. The old tuner-B
+scored **0.2681** here (≈ M0) — the known worst case is FIXED by
+pinning the multiplier: the tuner can no longer pick 1.5 on
+short-segment history. The two losses to persistence are small
+(no-refresh-24h +0.0086, growth-slow-x0.5 +0.0010) and B075 still
+beats M0 by −0.0860 / −0.0458 there. No collapse anywhere: worst
+B075 is no-refresh-24h 0.2039, still well below M0's 0.2899. B075
+beats B100 in all 9 scenarios.
+
+### Test 3 — Spread/coverage: fixed 0.75 vs 1.0 vs 1.5 (same tau, 5 seeds)
+
+| seed | tau | pinball 0.75 | pinball 1.0 | pinball 1.5 | cov90 0.75 | max width 0.75 | id2 q05 0.75 (1.5) |
+|---|---|---|---|---|---|---|---|
+| 7 | 24 | 0.1579 | 0.1855 | 0.2576 | 1.00 | 13.14pp | 83.80 (67.63) |
+| 11 | 12 | 0.1663 | 0.1915 | 0.2611 | 1.00 | 13.56pp | 83.26 (66.76) |
+| 13 | 48 | 0.1388 | 0.1722 | 0.2448 | 1.00 | 41.55pp | 35.91 (18.45) |
+| 23 | 12 | 0.1612 | 0.1882 | 0.2587 | 1.00 | 30.57pp | 10.03 (4.31) |
+| 29 | 24 | 0.1549 | 0.1840 | 0.2556 | 1.00 | 24.25pp | 68.89 (47.20) |
+| MEAN | | **0.1558** | 0.1843 | 0.2555 | | | |
+
+Fixed 0.75 beats 1.0 by −0.0285 and 1.5 by −0.0997 on mean pinball.
+Coverage90 = 1.00 on all seeds at 0.75 (not too tight). No extreme
+widening at 0.75: the 1.5 tail is ~2x as wide everywhere, and the
+id-2 q05 anomaly from the pre-check is gone at 0.75 (q05 far above
+the 1.5 value on every seed).
+
+### Test 4 — Final harness (f00-shaped, 96 reads)
+
+- `_is_frozen_case(f00-shape)` = **False** — final never enters frozen path.
+- `_backtest_choose` on the f00 reads: **tau=6, mult=0.75** (the tuner
+  previously picked 1.5 here; now pinned).
+- CLI run 1: 0.19 s, run 2: 0.14 s, **byte-identical: True** (< 8 s).
+- Format PASS (55 rows, 5 quantiles, monotone, in [0,100], ≤65,536 B).
+- CLI output == in-process forecast at (tau=6, mult=0.75): max |diff|
+  = **0.000000 pp** — proof the shipped CLI really uses 0.75.
+- id 2 q05 = **71.127** exactly (pre-check fixed-0.75 value; the
+  49.849-at-1.5 anomaly is gone).
+- f00 pinball (seed 7 truth): CLI fixed-0.75 = **0.2433** vs M0 0.3003
+  (reproduces the pre-check exactly).
+- p00/p01 frozen path intact: loss **0.000591** on both.
+
+### Verdict — LAYAK RESUBMIT (pending Ting's final verdict)
+
+All four tests pass. Fixed 0.75 strictly dominates M0: Test 1 5/5
+seeds (−0.0877 mean), Test 2 9/9 scenarios, Test 4 f00 0.2433 vs
+0.3003. The tuner failure mode that blocked eb82928 is removed by
+construction (mult is never chosen), and the known worst case
+(refresh-slow-12h) improved from 0.2681 (≈ M0) to 0.1734 (beats
+persistence). Honest caveats, unchanged: single-model-truth
+simulator (P1), B075 only beats persistence by 0.0092 on Leg C mean
+and loses to it in 2/9 misspec scenarios (small margins), and the
+real f00 history length is unverifiable from the kit. No bundle,
+check, or submit was done from this branch.

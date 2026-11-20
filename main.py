@@ -10,9 +10,10 @@ Two paths, strictly separated (no shared parameters or sigma):
     quantiles are a hair-thin logit spread (sigma = 0.003).
   * Rich path: whenever the history varies (the final case). Theil-Sen
     trend of logit(rate) vs log(1 + t/tau) on the last 24h of reads,
-    tau and spread multiplier chosen by rolling-origin backtest on the
-    case's own history, slope shrunk toward a level-band prior, damped
-    median, safety rails, horizon-aware spread.
+    tau chosen by rolling-origin backtest on the case's own history,
+    spread multiplier FIXED at 0.75 (the backtest no longer chooses
+    it — see _backtest_choose), slope shrunk toward a level-band prior,
+    damped median, safety rails, horizon-aware spread.
 
 Python 3.13, standard library only, no network, deterministic.
 """
@@ -60,14 +61,22 @@ PRACTICE_TARGETS = {
 #   PRIOR_WEIGHT 10 (spec): the band prior pulls the slope toward the
 #     band median; heavy shrinkage is the conservative choice.
 #   TAU_GRID unchanged (spec): inert on Leg C — every grid scores the same.
-#   MULT_GRID {0.5, 0.75, 1.0, 1.5}: the horizon-corrected backtest
-#     (see _backtest_choose) decides; 0.5 is NOT auto-kept. 0.25/0.35
-#     were tested and rejected as simulator overfitting (they ride the
-#     sigma clip floor).
+#   MULT FIXED 0.75 (Ting REVISI #2, 2026-11-20): the horizon-corrected
+#     backtest still CHOSE a multiplier, and on the 48h-history f00-shaped
+#     input it picked tau=6 / mult=1.5 — pinball 0.3050, WORSE than M0
+#     (0.3003), while fixed 0.75 scored 0.2433 on the same input. The
+#     48h history has ZERO origins with >= 24h before + >= 24h after, so
+#     the backtest could only score horizons <= ~42h and its choice was
+#     applied to a 108.5h forecast — P0 recurring on short history. The
+#     multiplier is therefore NO LONGER CHOSEN: _backtest_choose picks
+#     tau only, scored at the fixed multiplier. RICH_MULT_GRID is kept
+#     as a legacy constant (the old-6h diagnostic in revision_tests.py
+#     still references it) but production never selects from it.
 RICH_DAMPING = 0.4
 RICH_PRIOR_WEIGHT = 10
 RICH_TAU_GRID = (6, 12, 24, 48)
-RICH_MULT_GRID = (0.5, 0.75, 1.0, 1.5)
+RICH_MULT_FIXED = 0.75
+RICH_MULT_GRID = (0.5, 0.75, 1.0, 1.5)  # legacy; not used for selection
 
 
 # ---------------------------------------------------------------- helpers
@@ -285,24 +294,30 @@ def _forecast_window(reads, target_dt, horizon_h, tau, mult,
 def _backtest_choose(reads_all, damping, prior_weight):
     """Rolling-origin backtest on the case's own history, horizon-matched.
 
-    The production forecast fits the last 24h and extrapolates ~4.5 days,
-    so the (tau, mult) choice must be scored at LONG horizons. The
-    previous version scored the read 12 reads (6h) after each origin and
-    then applied the chosen multiplier to a 4.5-day forecast — a horizon
-    mismatch (P0): a spread that is right at 6h is far too tight at
-    4.5 days, because trend error grows with horizon while the 6h
-    backtest never sees it.
+    Chooses TAU only. The spread multiplier is FIXED at RICH_MULT_FIXED
+    (0.75) and is never chosen by this function — Ting REVISI #2
+    (2026-11-20): on the 48h-history f00-shaped input the previous
+    version picked tau=6 / mult=1.5 and scored pinball 0.3050, worse
+    than M0 (0.3003), while fixed 0.75 scored 0.2433 on the same input.
+    With only 48h of history there is no origin with >= 24h before +
+    >= 24h after, so the backtest could only score horizons <= ~42h
+    and its choice was applied to a 108.5h forecast (P0 recurring on
+    short history). Removing 1.5 from the grid would not fix that —
+    the tuner could still pick badly from too little data — so the
+    multiplier is pinned, and tau is scored at the fixed multiplier.
 
-    Origins: up to 5 evenly spaced read indices with >= 24h of history
-    before them (a full production-size fit window) and >= 24h after
-    them. For each origin the fit uses the 24h before it (exactly as
+    The production forecast fits the last 24h and extrapolates ~4.5
+    days, so the tau choice must be scored at LONG horizons. Origins:
+    up to 5 evenly spaced read indices with >= 24h of history before
+    them (a full production-size fit window) and >= 24h after them.
+    For each origin the fit uses the 24h before it (exactly as
     production does); the score is the mean 5-level pinball-logit
     against the reads at every available target horizon in
     {24, 48, 72, 96, 108} hours (first read at/after origin + horizon),
     weighted by horizon length so the longest available horizons drive
     the choice. If the history is too short for any 24h+ horizon, fall
     back to the longest available horizon per origin (the last read).
-    Defaults to (12, 1.0) when nothing is usable.
+    Defaults to (12, RICH_MULT_FIXED) when nothing is usable.
 
     The Theil-Sen fit is cached per (origin, tau): the fit depends on
     the origin window and tau only, not on mult or the target horizon,
@@ -310,7 +325,7 @@ def _backtest_choose(reads_all, damping, prior_weight):
     """
     n = len(reads_all)
     if n < 25:
-        return 12, 1.0
+        return 12, RICH_MULT_FIXED
     start_dt = reads_all[0][0]
     end_dt = reads_all[-1][0]
     # Candidate origins: full 24h fit window before, >= 24h after.
@@ -320,7 +335,7 @@ def _backtest_choose(reads_all, damping, prior_weight):
     if not cand:
         cand = [i for i in range(n) if i >= 12 and i + 12 < n]
         if not cand:
-            return 12, 1.0
+            return 12, RICH_MULT_FIXED
     if len(cand) > 5:
         step = (len(cand) - 1) / 4.0
         cand = sorted({cand[int(round(k * step))] for k in range(5)})
@@ -365,33 +380,36 @@ def _backtest_choose(reads_all, damping, prior_weight):
                 fits_cache[key] = (window, fits, _band_priors(fits))
         return fits_cache[key]
 
-    best, best_score = (12, 1.0), None
+    # Tau only: the multiplier is fixed (see docstring). Each tau is
+    # scored at RICH_MULT_FIXED so the tau choice is made at the
+    # production spread.
+    mult = RICH_MULT_FIXED
+    best, best_score = (12, RICH_MULT_FIXED), None
     for tau in RICH_TAU_GRID:
-        for mult in RICH_MULT_GRID:
-            total, wsum = 0.0, 0.0
-            for oi, tj, h in jobs:
-                got = _get_fit(oi, tau)
-                if got is None:
-                    continue
-                window, fits, priors = got
-                target_dt = reads_all[tj][0]
-                horizon_h = (target_dt - reads_all[oi][0]).total_seconds() / 3600.0
-                t0 = window[0][0]
-                target_x = math.log1p((target_dt - t0).total_seconds() / 3600.0 / tau)
-                truth = reads_all[tj][1]
-                for idx, f in enumerate(fits):
-                    med, sig = _forecast_one(
-                        f, priors[_band(f["last_rate"])], tau, mult,
-                        damping, prior_weight, target_x, horizon_h)
-                    qs = _quantiles_from(med, sig)
-                    yl = logit(truth[idx])
-                    for tau_l, qv in zip(LEVELS, qs):
-                        d = yl - logit(qv)
-                        total += h * 2.0 * max(tau_l * d, (tau_l - 1.0) * d)
-                        wsum += h
-            if wsum and (best_score is None or total / wsum < best_score):
-                best_score = total / wsum
-                best = (tau, mult)
+        total, wsum = 0.0, 0.0
+        for oi, tj, h in jobs:
+            got = _get_fit(oi, tau)
+            if got is None:
+                continue
+            window, fits, priors = got
+            target_dt = reads_all[tj][0]
+            horizon_h = (target_dt - reads_all[oi][0]).total_seconds() / 3600.0
+            t0 = window[0][0]
+            target_x = math.log1p((target_dt - t0).total_seconds() / 3600.0 / tau)
+            truth = reads_all[tj][1]
+            for idx, f in enumerate(fits):
+                med, sig = _forecast_one(
+                    f, priors[_band(f["last_rate"])], tau, mult,
+                    damping, prior_weight, target_x, horizon_h)
+                qs = _quantiles_from(med, sig)
+                yl = logit(truth[idx])
+                for tau_l, qv in zip(LEVELS, qs):
+                    d = yl - logit(qv)
+                    total += h * 2.0 * max(tau_l * d, (tau_l - 1.0) * d)
+                    wsum += h
+        if wsum and (best_score is None or total / wsum < best_score):
+            best_score = total / wsum
+            best = (tau, mult)
     return best
 
 

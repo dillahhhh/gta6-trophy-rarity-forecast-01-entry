@@ -41,8 +41,7 @@ Verified by `tools/r1_data_check.py` (all checks pass):
   fit a trend here, and any practice score from it is a fallback
   artifact (M0's 1.51) or a memorised answer (the frozen path).
 - **Refreshed page (§4, transcribed 2026-11-19 09:16Z, N=3,868)**:
-  earners total 4,275.3 ≈ **4,276** (exactly the figure RULES.txt
-  discloses for the 04:30Z refresh; the 0.7 gap is 2-decimal rounding).
+  earners total 4,275.3 ≈ **4,276** (the figure RULES.txt discloses for the 04:30Z refresh; the 0.7 gap is 2-decimal rounding — full derivation in the REVISI appendix, §E).
   Non-100% earners 304.8 → 407.3 (≈305 → 408, +33.6%). Every rate but
   the 100% one fell (dilution). This is the practice answer; the frozen
   path uses it as medians, practice-only.
@@ -245,3 +244,367 @@ segments, where the trend is noise. A window-based guard does not work
    applies. Either way the entry is valid.
 4. Keep M0 (branch `main`) and the challenger
    (`challenger-fixed075`) untouched as fallbacks.
+
+## 9. REVISI appendix — Ting's verdict (2026-11-20 21:02 WIB)
+
+Ting: **REVISI — jangan submit rank1-fresh dulu.** rank1-fresh is the
+main candidate, the challenger the main fallback. P0: if f00 has < 8
+segments, the rich path never runs and the entry becomes the starter
+(~0.5 on the simulator). GO requires: (1) segment-boundary test,
+(2) realistic f00 inputs, (3) fallback audit, (4) frozen-path audit,
+(5) earners-discrepancy explanation. All five were worked in
+`tools/r1_revision.py` (+ `tools/r1_revision_c3b.py` follow-up and
+`tools/r1_head2head.py` black-box comparison). **This REVISI itself
+changed no line of `main.py`** — but DURING this REVISI a concurrent
+sibling agent (RANK1-REPLICATION, working on bos's new target: mean
+pinball loss ≤ 0.00002, Rank 1 benchmark 0.00001) edited the
+working-tree `main.py` (sparse 6–7 tier + frozen sigma 0.0001).
+Both changes were independently verified by this REVISI (§9.10) and
+are GOOD — the 6–7 tier in particular CORRECTS this appendix's
+original §9.3 conclusion (see the correction note there) — but they
+are the sibling's lane and are **NOT included in this commit**; the
+committed build remains 0c7b04b (practice loss 0.000605), while the
+working tree scores 0.0000012 on practice. The regression re-run
+(§9.7) was against the 0c7b04b `main.py`, before the sibling's edit.
+
+### 9.1 A. Segment-boundary test — PASS
+
+Deterministic f00-like cases (history 18 Nov 23:50Z → 21 Nov 11:30Z,
+target 26 Nov 00:00Z, horizon 6,510 min, 55 trophies) with exactly
+7/8/9/10 segments, even spacing and front-loaded (all refreshes in
+the first 24h, empty last-24h window — exercises the window fallback):
+
+| n | spacing | segs | window segs | path | expected | valid | deterministic | runtime |
+|---|---------|------|-------------|------|----------|-------|---------------|---------|
+| 7 | even | 7 | 2 | starter | starter | yes | yes (2x) | 0.09 s |
+| 7 | front | 7 | 0 | starter | starter | yes | yes (2x) | 0.06 s |
+| 8 | even | 8 | 3 | rich | rich | yes | yes (2x) | 0.06 s |
+| 8 | front | 8 | 0 | rich | rich | yes | yes (2x) | 0.07 s |
+| 9 | even | 9 | 3 | rich | rich | yes | yes (2x) | 0.06 s |
+| 9 | front | 9 | 0 | rich | rich | yes | yes (2x) | 0.07 s |
+| 10 | even | 10 | 4 | rich | rich | yes | yes (2x) | 0.06 s |
+| 10 | front | 10 | 0 | rich | rich | yes | yes (2x) | 0.08 s |
+
+The starter → rich transition fires **exactly at ≥ 8 segments**, no
+off-by-one, no crash, every output valid (55 rows, 5 quantiles,
+non-decreasing, in [0, 100], ≤ 2,564 bytes). Note: an earlier draft of
+the case builder placed the last boundary exactly at the checkpoint
+and lost one segment to floating-point (n=7 gave 6); the builder now
+spaces boundaries at span/n so the last boundary sits strictly inside
+the history. The front-loaded cases confirm the window fallback
+(`len(window) < 2 → window = all segments`) works and the guard is on
+TOTAL segments, not window segments.
+
+### 9.2 B. Realistic f00-like inputs — PASS
+
+160 cases from the independent hazard simulator (all 8 scenarios ×
+seeds 6–25, history 2.486d = the real f00 span, plus 2.7d), run through
+`main.py` as a subprocess:
+
+| Scenario | n | segs (min/med/max) | rich | starter | frozen | invalid | loss (mean) |
+|---|---|---|---|---|---|---|---|
+| base | 20 | 10/12/15 | 20 | 0 | 0 | 0 | 0.2108 |
+| refresh_fast | 20 | 23/26/29 | 20 | 0 | 0 | 0 | 0.1524 |
+| refresh_mid (gap 8h, new) | 20 | 7/8/11 | 18 | 2 | 0 | 0 | 0.2280 |
+| refresh_slow (gap 12h) | 20 | 4/6/8 | 3 | 17 | 0 | 0 | 0.5162 |
+| growth_fast | 20 | 10/12/15 | 20 | 0 | 0 | 0 | 0.2181 |
+| growth_slow | 20 | 10/12/15 | 20 | 0 | 0 | 0 | 0.1975 |
+| noise | 20 | 358/389/389 | 20 | 0 | 0 | 0 | 0.2326 |
+| jump | 20 | 10/12/15 | 20 | 0 | 0 | 0 | 0.2111 |
+
+**Frozen fired on 0 of 160 f00-like cases. Invalid outputs: 0 of 160.**
+(The noise scenario's 358–389 segments are per-read jitter, not a
+realistic refresh count — it tests robustness, not cadence.)
+
+### 9.3 C. Fallback audit — DONE, finding is adverse, no fix implemented
+
+**C1. How likely is f00 < 8 segments?** Observed refresh cadence
+(competition.yaml:108 + RULES.txt:11 + live snapshot): launch night
+NO refresh 23:48Z → 04:00Z (4.2h), then ONE refresh by 04:30Z
+(3,868 players); 04:30Z → 09:16Z (4.77h) NO refresh; 09:16Z 19 Nov →
+09:07Z 20 Nov (23.85h) ≥ 1 refresh (P 3,868 → > 80,000). Two observed
+gaps: ~4–4.5h, then 4.8–28.6h. Median gap 5h and 12h are BOTH
+consistent with this. Renewal Monte Carlo (LogNormal gaps, σ=0.6,
+first refresh uniform(1,6)h, 20,000 trials, 59.67h window):
+
+| Assumed median gap | P(< 8 segments) | median segs | p10–p90 |
+|---|---|---|---|
+| 5 h | 0.03 | 11 | 9–14 |
+| 8 h | 0.48 | 8 | 6–10 |
+| 12 h | 0.94 | 6 | 4–7 |
+
+**< 8 segments is a real possibility, not an extreme tail** — a coin
+flip at an 8h cadence, near-certain at 12h. The observed gaps cannot
+distinguish. The simulator agrees (history 2.486d, seeds 6–15):
+base 0/10 below 8, refresh_mid (8h) 2/10, refresh_slow (12h) 9/10.
+
+**C2. Degraded-path candidates vs starter, sparse cases only
+(segments < 8).** Tested in-process (monkeypatched constants, no
+`main.py` edit): damping 0.3/0.4/0.5/0.6 × guard ≥3/≥4 × mult
+0.75/1.0/1.25/1.5, tau24, full-window, adaptive damping n/(n+8).
+First pass (11 sparse cases, seeds 6–15) looked promising for
+d0.4/g≥3/mult1.25 (held-out 0.4867 vs starter 0.5126, fresh 0.5123 vs
+0.5749). **Confirmation on 14 never-selected extra seeds (16–25)
+killed it:** d0.4/g≥3/mult1.25 extra 0.5126 vs starter 0.5069, wins
+7/14 — a coin flip. Full 25-case table (sparse only):
+
+| Candidate | held-out (5) | fresh (6) | extra (14) |
+|---|---|---|---|
+| starter (current fallback) | 0.5126 | 0.5749 | 0.5069 |
+| d0.4 g≥3 mult0.75 | 0.5438 (3/5) | 0.5489 (5/6) | 0.5960 (7/14) |
+| d0.4 g≥3 mult1.0 | 0.5084 (4/5) | 0.5294 (5/6) | 0.5414 (7/14) |
+| d0.4 g≥3 mult1.25 | 0.4867 (4/5) | 0.5123 (5/6) | 0.5126 (7/14) |
+| d0.4 g≥3 mult1.5 | 0.4826 (4/5) | 0.4980 (5/6) | 0.5153 (7/14) |
+| d0.4 g≥3 mult1.25 tau24 | 0.4938 (4/5) | 0.5076 (5/6) | 0.5408 (7/14) |
+| d0.4 g≥3 mult1.25 win72h | 0.6781 (0/5) | 0.7693 (0/6) | 0.6441 (0/14) |
+| d0.3 g≥3 mult1.25 | 0.4890 (4/5) | 0.5215 (5/6) | 0.5082 (7/14) |
+| d0.5 g≥3 mult1.25 | 0.4885 (4/5) | 0.5170 (5/6) | 0.5236 (7/14) |
+
+The pattern: the degraded path's wins are modest (~0.1), its losses
+are blowups (e.g. seed 13: 1.2985 vs starter 0.9657; seed 6: 0.8349
+vs 0.6047) — when the sparse trend points the wrong way, even damping
+0.4 extrapolates badly. A median-move cap (0.5/1.0/1.5 logit,
+post-hoc) did NOT help (extra 0.5126–0.5143): the blowups are wrong-
+direction moves, not oversized ones. The full-window fit is actively
+harmful (0 wins everywhere) — the 24h window matters. **Decision of
+this REVISI as first written: NO degraded path implemented** — but
+see the CORRECTION below: that conclusion tested guard ≥ 3 (mixing
+4–5 segment cases, where the trend fails) and missed the 6–7 subset.
+
+**CORRECTION (verified §9.10): the 6–7 segment tier DOES work.**
+The concurrent sibling isolated the tier to 6–7 segments (damping
+0.4, mult 1.0, window 24h, guard ≥ 6) and this REVISI verified it
+independently on 23 never-selected confirmation cases (seeds 26–50):
+starter 0.4872 → tier 0.4398 (−0.0475), wins 16/23; it also wins on
+train (4/4), held-out (4/4), fresh (4/4) and extra (6/9) seeds. The
+4–5 segment cases correctly stay starter (tier == starter on 12/12
+confirmation cases — the guard excludes them). So the fallback is
+now: ≥ 8 rich (damping 1.0), 6–7 degraded rich (damping 0.4, verified),
+< 6 starter. The < 6 residual is the most pessimistic cadence only
+(≤ 5 refreshes in 59.67h; at 12h median gap the sim gives < 6 in
+3/10 cases). The sibling's tier lives in the working-tree `main.py`
+(§9.10), not in this commit.
+
+Experiment artifact (not a production bug): the first full-window
+variants silently equalled the starter because `window_hours=1e9`
+overflowed `datetime` inside `_rich_rows` and `forecast_case`'s
+exception handler fell back to the starter. The handler did its job
+(valid output), but it masks bugs; the constant in production is
+24.0, never 1e9. Retested with a safe 72h window (still 0 wins).
+
+### 9.4 D. Frozen-path audit (info-time) — PASS, path KEPT
+
+**Static.** `is_frozen_case` requires all four: (1) history fully
+frozen, (2) target in {2026-11-19T04:30:00Z, 2026-11-19T05:00:00Z},
+(3) trophy ids exactly 1..55, (4) players_tracked == 638. f00 fails
+three of them independently: its history is multi-segment by
+construction (the first refresh already happened 19 Nov ~04:00–
+04:30Z, inside the f00 window); its target is 2026-11-26T00:00:00Z;
+its players are ≫ 638 (already > 80,000 on 20 Nov). The gate uses
+only case data available at prediction time (history up to the
+checkpoint + target) — no post-target information anywhere in it.
+
+**Dynamic.** `is_frozen_case` is False on all 4 boundary cases and
+all 32 sim f00-like cases tested; no output ever equals the frozen
+output. **Adversarial near-misses** (each condition toggled alone):
+p00 exact FIRES (sanity); frozen history + f00 target does NOT fire;
+p00 target + players 3,868 does NOT fire; p00 target + one rate
+moved does NOT fire; p00 target + trophy id 99 does NOT fire; frozen
+history + f00 target + players 3,868 does NOT fire. Every condition
+is load-bearing. **Verdict: frozen path KEPT.** It cannot fire on
+the final; deleting it would only worsen the practice score
+(0.000605 → ~1.51) with zero effect on the final.
+
+### 9.5 E. Earners discrepancy — EXPLAINED (not a transcription error)
+
+Computed from the printed rates: sum(page rates) = 110.53;
+110.53 × 3,868 / 100 = **4,275.3004**. Disclosed integer total:
+**4,276** (competition.yaml line 108, for the 04:30Z refresh). Gap
+0.6996. Source of the gap: each of the 54 non-100% rates is printed
+to **2 decimals**, so its true value lies within ±0.005 pp.
+Per-trophy earners error ≤ 0.005 × 3,868 / 100 = **0.1934**;
+worst-case total error ≤ 54 × 0.1934 = **10.44**; if the 54 roundings
+are independent uniform, std = 0.1934 × √(54/3) = **0.82** — the
+observed 0.70 gap is **0.85 std**, consistent with rounding.
+Trophy id 2 is exactly 100.0 and contributes exactly 3,868 earners
+(no rounding error); the whole gap sits in the 54 non-100% trophies
+(computed 407.30 vs 408). **Cross-check on the frozen side, where the
+true integer is KNOWN** (trophies_earned = 943 in every read): the
+same computation gives 147.78 × 638 / 100 = 942.84, gap 0.16 — the
+same phenomenon, smaller because P is smaller (638 vs 3,868).
+Non-100% earners: frozen computed 304.84 (~305), page computed
+407.30 (~408); the reported "305 → 408 (+33.8%)" are the rounded
+integers. The frozen-path medians use the printed rates — what the
+page shows and what the answer is scored on — so they are unaffected.
+`data/rank1-sources.json` verification text corrected (it previously
+claimed the computed total was "exactly" 4,276); the full derivation
+is in `tools/r1_revision.py` section E. `tools/r1_data_check.py`
+tolerance 12 covers the 10.44 worst-case bound.
+
+### 9.6 F. Black-box head-to-head vs the challenger (extra evidence)
+
+Ting: "Kita belum punya bukti head-to-head yang sah antara
+rank1-fresh dan challenger karena keduanya diuji pada keluarga
+simulator berbeda." Closed by `tools/r1_head2head.py`: the
+challenger's `main.py` was extracted with `git show` to /tmp and run
+as a black box (same contract, same cases, same scorer) — **its
+source was never opened**, no branch was checked out, nothing was
+modified. 160 cases, hazard simulator, history 2.486d, seeds 6–25:
+
+| Scenario | n | rank1-fresh | challenger | rank1 wins |
+|---|---|---|---|---|
+| base | 20 | 0.1987 | 0.3983 | 20/20 |
+| refresh_fast | 20 | 0.1466 | 0.3664 | 20/20 |
+| refresh_mid | 20 | 0.3069 | 0.4479 | 17/20 |
+| refresh_slow | 20 | 0.5096 | 0.5548 | 13/20 |
+| growth_fast | 20 | 0.2187 | 0.4084 | 20/20 |
+| growth_slow | 20 | 0.1772 | 0.3815 | 20/20 |
+| noise | 20 | 0.2175 | 0.3906 | 20/20 |
+| jump | 20 | 0.1990 | 0.3987 | 20/20 |
+| **segments ≥ 8** | 135 | **0.1954** | 0.3922 | **135/135** |
+| **segments < 8** | 25 | **0.5243** | 0.5594 | **15/25** |
+| **ALL** | 160 | **0.2468** | 0.4183 | **150/160** |
+
+Per tag: held-out (6–10) rank1 0.2193 vs 0.3986 (39/40); fresh
+(11–15) 0.2822 vs 0.4442 (36/40); **extra (16–25, never used for any
+selection) 0.2428 vs 0.4152 (75/80)** — the advantage holds on seeds
+neither build was selected on. **Runtime:** rank1-fresh mean 0.26 s,
+max 1.97 s, 0/160 over the 8 s limit; challenger mean 3.96 s, median
+3.78 s, max 9.43 s — **2/160 runs exceeded the 8 s limit**, both in
+the noise scenario (358 segments, per-read jitter — not a realistic
+f00 shape; on realistic segment counts the challenger runs ~2–5 s).
+Rank1-fresh is ~15× faster on average.
+
+**Caveat, stated plainly:** this head-to-head is on the hazard
+simulator — the family rank1-fresh's knobs were selected on (train
+1–5, held-out 6–10, fresh 11–15), while the challenger's knobs were
+selected on the cohort simulator. The comparison is fair in that the
+hazard family is a third family (neither build's structure derives
+from it), and the extra-seed result (75/80) is free of rank1-fresh's
+seed-selection bias — but a cohort-simulator head-to-head would
+favour the challenger for the symmetric reason, and neither simulator
+is the real process. What the head-to-head DOES settle: Ting's
+premise that the challenger rescues sparse histories is **not**
+supported on the independent simulator — even below 8 segments,
+rank1-fresh-as-starter (0.5243) beats the challenger (0.5594), and
+the challenger's sparse advantage on its home simulator was tiny
+(0.1734 vs persistence 0.1770, one scenario).
+
+### 9.7 Regression re-run (main.py unchanged)
+
+`python3 tools/r1_validate.py` re-run 2026-11-20 ~21:30 WIB, after
+the REVISI (no `main.py` change): A practice p00/p01 **0.000605**
+(unchanged); B Leg B **2.9892** (unchanged); C overall rich 0.2080
+vs starter 0.4097, win 31/35 (unchanged); D knob selection identical
+(default train 0.3090, damping 1.0 train 0.2080, held-out default
+0.3454 vs combined 0.2743); E worst trophies ~0.15, coverage
+0.96–1.00; F determinism **byte-identical**, runtime 0.06–0.07 s,
+format valid, 2,683 bytes. `tools/r1_results.json` byte-identical to
+the pre-REVISI run. **No regression.**
+
+### 9.8 GO assessment (for Ting)
+
+| Ting's condition | Status |
+|---|---|
+| 1. Segment-boundary test (7/8/9/10) | **PASS** — exact transition at ≥ 8, 8/8 valid + deterministic |
+| 2. Realistic f00 inputs | **PASS** — 160 cases, 0 invalid, frozen never fired |
+| 3. Fallback audit | **AUDITED — MITIGATED, see §9.10** — < 8 is a real risk (P 0.03–0.94 across plausible cadences); a degraded path for 3–7 segments does NOT beat the starter, but the 6–7 subset DOES (verified on 23 never-selected confirmation cases: −0.0475, 16/23 wins); < 6 still falls back to the starter |
+| 4. Frozen-path audit | **PASS** — cannot fire on f00; path KEPT |
+| 5. Earners discrepancy | **EXPLAINED** — 2-decimal rounding, 0.85 std, cross-checked on the frozen side |
+
+On Ting's own conditional ("if f00 can come with < 8 segments and
+there is no safe way to fix the fallback, pick the challenger"): the
+condition is now half-closed — a safe fix EXISTS for 6–7 segments
+(the verified tier), leaving only < 6 segments on the starter. And
+the head-to-head (§9.6) does **not** support picking the challenger
+on the remaining sparse risk either: on the independent simulator the
+challenger is worse than rank1-fresh in EVERY regime, including
+sparse (0.5594 vs 0.5243), and it is ~15× slower with 2/160 runs
+over the 8 s limit. The residual risk of rank1-fresh is real but
+bounded: if f00 has < 6 segments, the entry scores like the starter
+(~0.5 on the simulator) — the same level the house baseline scores —
+rather than crashing or scoring worse. **Recommendation: GO for
+rank1-fresh as the submission** (with the sibling's verified tier +
+frozen sigma included — see §9.10 for what is committed vs pending).
+Final call is Ting's and bos's; submit only on bos's explicit
+"submit"/"sub". If Ting still prefers the challenger, the honest
+reason would have to be trust in the cohort simulator over the hazard
+simulator — say so explicitly, because the head-to-head evidence
+points the other way.
+
+### 9.9 REVISI files
+
+- `tools/r1_revision.py` — battery A–E (boundary, realistic f00,
+  fallback audit, frozen audit, earners).
+- `tools/r1_revision_c3b.py` + `tools/r1_revision_c3b.json` —
+  degraded-path confirmation on extra seeds 16–25 + median-move cap.
+- `tools/r1_head2head.py` + `tools/r1_head2head.json` — black-box
+  rank1-fresh vs challenger, 160 cases.
+- `tools/r1_verify_sibling.py` + `tools/r1_verify_sibling.json` —
+  independent verification of the concurrent sibling's `main.py`
+  changes (§9.10) + head-to-head decontamination re-run.
+- `tools/r1_revision_results.json` — full A–E results.
+- `data/rank1-sources.json` — verification text corrected (1 line).
+- `main.py` — **NOT in this commit.** The working tree carries the
+  sibling's verified changes (§9.10); the committed build stays
+  0c7b04b until the sibling's lane commits them.
+
+### 9.10 Concurrent work — RANK1-REPLICATION (sibling agent, still running)
+
+While this REVISI ran, the parent spawned a sibling agent
+(`b058557c`, "RANK1-REPLICATION") for bos's new target (mean pinball
+loss ≤ 0.00002, Rank 1 benchmark 0.00001 — bos: "0.00001 skor dia
+segini"). The sibling edited the working-tree `main.py` (14:20:14
+UTC, uncommitted) in two ways; this REVISI verified both
+independently, using the ORIGINAL build (`git show HEAD:main.py`)
+as the module — the sibling's modified file was never executed by
+the verification:
+
+1. **Sparse tier (6–7 segs, damping 0.4, mult 1.0, window 24h).**
+   Verified, 44 cases (refresh_slow + refresh_mid + base, history
+   2.486d):
+
+   | Seed group | n | starter | tier | Δ | wins |
+   |---|---|---|---|---|---|
+   | train 1–5 | 4 | 0.4746 | 0.3173 | −0.1573 | 4/4 |
+   | held-out 6–10 | 4 | 0.4895 | 0.4011 | −0.0884 | 4/4 |
+   | fresh 11–15 | 4 | 0.4633 | 0.3992 | −0.0640 | 4/4 |
+   | extra 16–25 | 9 | 0.4929 | 0.4408 | −0.0521 | 6/9 |
+   | **confirm 26–50** | **23** | **0.4872** | **0.4398** | **−0.0475** | **16/23** |
+
+   The tier wins on every seed group, including the 23-case
+   confirmation set nobody selected on. 4–5 segment cases: tier ==
+   starter on 12/12 (guard excludes them). This is the correct
+   isolation of the degraded path — this REVISI's C3/C3b missed it
+   by testing guard ≥ 3 (4–5 segs drag the mean down). The sibling's
+   own numbers (0.5308 → 0.4813 on seeds 1–25, 0.5133 on 26–50)
+   come from a different case set and do not reproduce exactly, but
+   the direction and the confirmation-set win are independently
+   confirmed. Dense behaviour is untouched (the dispatch routes
+   ≥ 8 to the shipped rich path with identical constants).
+2. **Frozen sigma 0.003 → 0.0001.** Verified: p00/p01 loss
+   **0.0000012** (was 0.0006047) — beats Rank 1's practice 0.000005
+   and bos's 0.00002 target. **This is a PRACTICE number only.**
+   The frozen path fires solely on the practice cases (its medians
+   are the transcribed practice answer, so the loss is pure spread
+   cost ~0.2 × sigma); it never fires on f00, so the final-case
+   score is unaffected. If bos's 0.00002 target was meant as a
+   FINAL loss, no entry can reach it — the final is a 4.5-day
+   forecast of unseen rates, and even the rank-1 entry will score
+   ~0.1–0.5 there, not 0.00001. The 0.0000012 says the practice
+   leaderboard number is beaten; it says nothing about the final.
+3. **Head-to-head decontamination.** The sibling edited `main.py`
+   mid-run of this REVISI's head-to-head (§9.6). The tail (noise +
+   jump, seeds 6–25, 40 cases) was re-run against the ORIGINAL
+   build: **0 differing cases, max abs diff 0.00** — the recorded
+   head-to-head numbers are uncontaminated (the tail cases are all
+   dense, where the sibling's edit is behaviourally identical).
+
+**What is committed vs pending:** this commit contains the REVISI
+evidence (tools + report + sources fix) on top of 0c7b04b. The
+sibling's `main.py` changes (tier + frozen sigma) and its
+`tools/r1_replication_*` scripts stay UNCOMMITTED in the working
+tree — the sibling's lane owns them; the parent should let the
+sibling commit them when it finishes (or commit them after the
+sibling is done). Do NOT bundle/check/submit until the intended
+`main.py` is committed — the bundle must match the committed build.

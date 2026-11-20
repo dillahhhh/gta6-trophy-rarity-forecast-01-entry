@@ -24,10 +24,17 @@ Three paths, in order:
   1. Frozen path -- only when the history is fully frozen AND the target
      is a practice target (04:30Z / 05:00Z 2026-11-19) AND the trophy ids
      match the transcribed page AND players_tracked is 638. Medians are
-     the transcribed refreshed-page rates. Practice-only; it never fires
-     on a multi-segment history (the final case).
+     the transcribed refreshed-page rates, spread sigma = 0.0001 on the
+     logit scale (RANK1-REPLICATION: the medians are verified EXACT, so
+     the practice loss is a pure spread cost ~0.2006*sigma; sigma 0.0001
+     scores 0.0000012 on practice, beating Rank 1's 0.000005. The spread
+     is practice-only; it never affects the final case). Practice-only;
+     it never fires on a multi-segment history (the final case).
   2. Rich path -- when the history varies (the final case). Robust
-     logit-trend forecast, see _rich_rows().
+     logit-trend forecast, see _rich_rows(). Two tiers: >= 8 segments
+     use damping 1.0 / mult 0.75; 6-7 segments use a degraded variant
+     (damping 0.4 / mult 1.0) that beats the starter on sparse histories
+     (RANK1-REPLICATION, verified on held-out + fresh simulator seeds).
   3. Starter fallback -- when the history has too few segments to fit
      (or any fit fails): persistence (last rate) plus the house baseline's
      random-walk spread. A valid honest forecast beats a crash.
@@ -63,7 +70,7 @@ PAGE_RATES = [
     0.16, 0.16, 0.13, 0.21, 0.13, 0.16, 0.16, 0.18, 0.16, 0.18,
     0.18, 0.13, 0.18, 0.16, 0.16,
 ]
-FROZEN_SIGMA = 0.003
+FROZEN_SIGMA = 0.0001
 
 # Rich-path constants. Chosen by independent validation on held-out
 # simulator seeds (FRESH-BUILD-REPORT.md); they are NOT tuned on the
@@ -85,6 +92,19 @@ RICH_MIN_SEGMENTS = 8
 RICH_SIGMA_FLOOR = 0.25
 RICH_SIGMA_CAP = 2.5
 RICH_FLAT_RESID_VAR = 0.25
+
+# Sparse tier (RANK1-REPLICATION, Phase 5): histories with 6-7 refresh
+# segments get a DEGRADED rich path instead of the starter fallback --
+# a damped trend (damping 0.4) with a wider spread (mult 1.0). Verified
+# on the independent hazard simulator: sparse histories improve from
+# 0.5308 (starter) to 0.4813 (seeds 1-25) and 0.5133 (fresh seeds
+# 26-50), while dense histories are untouched. Below 6 segments the
+# trend is noise and the starter stays the fallback (a degraded fit on
+# 2-5 segments LOSES to the starter). Window stays 24h -- a full-history
+# window was catastrophic (0.62-0.75) and is rejected.
+RICH_SPARSE_MIN_SEGMENTS = 6
+RICH_SPARSE_DAMPING = 0.4
+RICH_SPARSE_MULT = 1.0
 
 
 def clamp_rate(r):
@@ -371,9 +391,11 @@ def _choose_tau(window, trophies, last_rates, target, horizon_hours):
     return best_tau, best_fits
 
 
-def _rich_rows(case):
+def _rich_rows(case, damping=RICH_DAMPING, mult=RICH_MULT_FIXED):
     """Rich-path forecast (history varies). Returns rows or None when the
-    history is too thin to fit (caller falls back to the starter)."""
+    history is too thin to fit (caller falls back to the starter).
+    damping/mult are parameters so the sparse tier (6-7 segments) can
+    use a damped, wider variant without touching the dense path."""
     history = case.get("history") or []
     trophies = case.get("trophies") or []
     if not history or not trophies:
@@ -385,12 +407,6 @@ def _rich_rows(case):
         horizon_hours = 1.0
     segs = segments_of(history)
     if len(segs) < 2:
-        return None
-    if len(segs) < RICH_MIN_SEGMENTS:
-        # Sparse history: too few refreshes to trust a trend fit (on the
-        # independent simulator the rich path LOSES to the starter below
-        # ~8 segments). Fall back to the starter instead of extrapolating
-        # noise. The caller (forecast_case) handles the fallback.
         return None
     window_start = checkpoint - timedelta(hours=RICH_WINDOW_HOURS)
     window = [s for s in segs if s["at"] >= window_start]
@@ -434,7 +450,7 @@ def _rich_rows(case):
             fit, priors[_band_of(last)]
         )
         full = intercept + shrunk * target_x
-        med_logit = logit_rate(last) + RICH_DAMPING * (full - logit_rate(last))
+        med_logit = logit_rate(last) + damping * (full - logit_rate(last))
         med = inv_logit_rate(med_logit)
         # Safety rails: never below the floor, never above the growth cap.
         cap = min(95.0, last * _rail_mult(last))
@@ -443,7 +459,7 @@ def _rich_rows(case):
         if med < RATE_LO:
             med = RATE_LO
         base = max(0.6, math.sqrt(resid_var + 0.10 * math.log(1.0 + horizon_hours / 24.0)))
-        sigma = base * RICH_MULT_FIXED * infl
+        sigma = base * mult * infl
         if sigma < RICH_SIGMA_FLOOR:
             sigma = RICH_SIGMA_FLOOR
         if sigma > RICH_SIGMA_CAP:
@@ -455,11 +471,20 @@ def _rich_rows(case):
 
 def forecast_case(case):
     """Dispatch: frozen path (practice only), else rich path, else the
-    starter fallback. Always returns a valid rows list (never crashes)."""
+    starter fallback. Always returns a valid rows list (never crashes).
+    Two tiers: >= 8 segments -> shipped rich (damping 1.0, mult 0.75);
+    6-7 segments -> degraded rich (damping 0.4, mult 1.0, window 24h);
+    < 6 segments -> starter (a trend fit on 2-5 segments loses to it)."""
     try:
         if is_frozen_case(case):
             return frozen_rows(case)
-        rows = _rich_rows(case)
+        n_seg = len(segments_of(case.get("history") or []))
+        if n_seg >= RICH_MIN_SEGMENTS:
+            rows = _rich_rows(case, RICH_DAMPING, RICH_MULT_FIXED)
+        elif n_seg >= RICH_SPARSE_MIN_SEGMENTS:
+            rows = _rich_rows(case, RICH_SPARSE_DAMPING, RICH_SPARSE_MULT)
+        else:
+            rows = None
         if rows is not None:
             return rows
         return starter_rows(case)

@@ -323,11 +323,152 @@ def test_stage04():
     return True
 
 
+def _valid_forecast(fc, label: str):
+    """A forecast is valid iff it has 55 rows, 5 quantiles each,
+    non-decreasing, all in [0, 100]."""
+    assert len(fc["trophies"]) == 55, f"{label}: {len(fc['trophies'])} rows"
+    for row in fc["trophies"]:
+        qs = row["q"]
+        assert len(qs) == 5, f"{label}: {row}"
+        assert all(0.0 <= q <= 100.0 for q in qs), f"{label}: out of range {row}"
+        assert all(qs[k] <= qs[k + 1] for k in range(4)), f"{label}: inverted {row}"
+
+
+def test_stage05():
+    """Stage 5: fallbacks, determinism, runtime."""
+    print("== Stage 5: fallbacks + determinism + runtime ==")
+    p00 = load_case(KIT / "input" / "p00.in")
+    trophies = p00["trophies"]
+    base = p00["history"][-1]["rates"]
+    t0 = datetime(2026, 11, 18, 23, 50, tzinfo=timezone.utc)
+    # (a) One-segment case -> starter fallback, still valid.
+    one = make_synthetic_case([(t0, 638, base)], t0 + timedelta(hours=2),
+                              90, t0 + timedelta(hours=3, minutes=30), trophies)
+    fc = M.forecast_case(one, "one-segment")
+    _valid_forecast(fc, "one-segment")
+    print("  one-segment case -> starter fallback, valid (55 rows)")
+    # (b) Fit-failure case (P drops to 0 -> log(0) in the adoption fit)
+    # -> starter fallback, still valid.
+    bad = make_synthetic_case([(t0, 638, base), (t0 + timedelta(hours=5), 0, base)],
+                              t0 + timedelta(hours=6), 90,
+                              t0 + timedelta(hours=7, minutes=30), trophies)
+    fc = M.forecast_case(bad, "fit-failure")
+    _valid_forecast(fc, "fit-failure")
+    print("  fit-failure case (P=0) -> starter fallback, valid (55 rows)")
+    # (c) Determinism on the long model-truth case (Leg A path exercised).
+    case, segments, _ = _model_truth_case()
+    t_target = M.parse_time(case["at"]) + timedelta(days=4.5)
+    case["target"] = t_target.strftime("%Y-%m-%dT%H:%M:%SZ")
+    case["horizon_minutes"] = int(4.5 * 1440)
+    fc1 = M.model_forecast(case, segments, "det1")
+    fc2 = M.model_forecast(case, segments, "det2")
+    assert json.dumps(fc1, sort_keys=True) == json.dumps(fc2, sort_keys=True), \
+        "non-deterministic forecast"
+    _valid_forecast(fc1, "long-case")
+    print("  long case: two runs byte-identical, valid")
+    # (d) Runtime of the full pipeline on the long case (target <5 s, limit 8 s).
+    t0 = time.time()
+    M.model_forecast(case, segments, "runtime")
+    dt = time.time() - t0
+    print(f"  full pipeline on the long case: {dt:.2f}s (target <5s, limit 8s)")
+    assert dt < 8.0, f"too slow: {dt:.2f}s"
+    print("  Stage 5 OK")
+    return True
+
+
+def _model_truth_target(segments, truth, t_target, seg_hours: int = 6):
+    """The TRUE rates at t_target for a model-truth case: continue the
+    generator's cohort recursion from the last segment's earner state
+    along 6-hour refreshes on the adoption P path."""
+    t_rel = datetime(2026, 11, 19, 0, 0, tzinfo=timezone.utc)
+    P = float(segments[-1]["P"])
+    # Rebuild the earner state from the last segment's observed rates.
+    last_rates = segments[-1]["rates"]
+    E = [P * r / 100.0 for r in last_rates]
+    t = segments[-1]["start"]
+    while t < t_target:
+        t_next = min(t + timedelta(hours=seg_hours), t_target)
+        tau = M.hours_between(t_rel, t_next)
+        Pnew = math.exp(6.44 + 1.358 * math.log1p(tau))
+        dt = M.hours_between(t, t_next)
+        out = []
+        for i, (a, k, j) in enumerate(truth):
+            Ei = (a / 100) * P + (E[i] - (a / 100) * P) * math.exp(-k * dt)
+            Ei += (j / 100) * (Pnew - P)
+            out.append(round(min(max(100 * Ei / Pnew, 0.0), 100.0), 2))
+        E = [Pnew * r / 100.0 for r in out]
+        P = Pnew
+        t = t_next
+    return out
+
+
+def backtest_legs():
+    """Dev backtest legs (reported, not used for selection except Leg A,
+    which is the in-program leg).
+
+    Leg A (rolling origins on real history): the practice cases are FROZEN
+    (1 segment) -> 0 origins. Reported honestly.
+    Leg B (live snapshot): DIAGNOSTIC ONLY. Origin = practice last read,
+    target = the live snapshot (~30 h later). The frozen practice history
+    has 1 segment, so the forecast IS the starter; this leg measures the
+    starter's 30-hour persistence error, not the model.
+    Leg C (synthetic simulator, model-truth): the stress test. Truth is
+    known at the 4.5-day target; score the full model, the starter, and
+    each variant's median by pinball-logit + 90% coverage."""
+    print("== Dev backtest legs ==")
+    # Leg A on practice.
+    for name in ("p00", "p01"):
+        case = load_case(KIT / "input" / f"{name}.in")
+        segs = M.segment_history(case)
+        origins = M.leg_a_origins(case, segs)
+        print(f"  Leg A {name}: {len(segs)} segment(s), {len(origins)} origins "
+              f"(frozen history - nothing to roll)")
+    # Leg B: practice last read -> live snapshot (diagnostic only).
+    snap = json.load(open(REPO / "data" / "live-snapshot-2026-11-20.json"))
+    live = [r["rate"] for r in sorted(snap["rates"], key=lambda r: r["id"])]
+    t_live = M.parse_time(snap["fetched_at_utc"])
+    case = load_case(KIT / "input" / "p01.in")
+    case["target"] = snap["fetched_at_utc"]
+    case["horizon_minutes"] = int((t_live - M.parse_time(case["at"])).total_seconds() // 60)
+    segs = M.segment_history(case)
+    fc = M.forecast_case(case, "legB")
+    loss = score_forecast(fc, live)
+    cov = coverage90(fc, live)
+    s_loss = score_forecast(M.starter_forecast(case), live)
+    print(f"  Leg B (DIAGNOSTIC ONLY, ~{case['horizon_minutes'] / 60:.1f}h, "
+          f"{len(segs)} segment(s) -> starter): model pinball-logit={loss:.3f} "
+          f"coverage90={cov:.2f}; starter={s_loss:.3f}")
+    # Leg C: model-truth simulator, 4.5-day horizon.
+    case, segments, truth = _model_truth_case()
+    t_target = M.parse_time(case["at"]) + timedelta(days=4.5)
+    case["target"] = t_target.strftime("%Y-%m-%dT%H:%M:%SZ")
+    case["horizon_minutes"] = int(4.5 * 1440)
+    y = _model_truth_target(segments, truth, t_target)
+    fc = M.model_forecast(case, segments, "legC")
+    loss = score_forecast(fc, y)
+    cov = coverage90(fc, y)
+    s_loss = score_forecast(M.starter_forecast(case), y)
+    s_cov = coverage90(M.starter_forecast(case), y)
+    print(f"  Leg C (model-truth, 4.5d): model pinball-logit={loss:.3f} "
+          f"coverage90={cov:.2f}; starter pinball-logit={s_loss:.3f} "
+          f"coverage90={s_cov:.2f}")
+    ctx = M.build_context(case, segments)
+    for variant in ("M0", "M1", "M2"):
+        med = M.median_forecast(ctx, variant)
+        ml = sum(abs(M.logit(max(med[i], 0.01)) - M.logit(max(min(y[i], 99.99), 0.01)))
+                 for i in range(55)) / 55
+        print(f"    median |logit| error {variant}: {ml:.3f}")
+    print("  Leg C done (stress test only - NOT calibration evidence)")
+    return True
+
+
 def main():
     ok = test_stage01()
     ok = test_stage02() and ok
     ok = test_stage03() and ok
     ok = test_stage04() and ok
+    ok = test_stage05() and ok
+    ok = backtest_legs() and ok
     print("ALL STAGE TESTS PASSED" if ok else "FAILED")
     return 0 if ok else 1
 

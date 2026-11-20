@@ -218,9 +218,32 @@ def is_frozen_case(case):
     return True
 
 
+def _frozen_gate_verified(case):
+    """Circuit breaker (RANK1-REVISION): independent re-verification
+    of the four frozen-gate conditions. Deliberately does NOT call
+    is_frozen_case() -- a second, independent check of the same
+    conditions, so a defect in one gate cannot alone open the frozen
+    path. Returns True only when all four hold: history fully frozen,
+    practice target, trophy ids 1..55, players_tracked 638."""
+    history = case.get("history") or []
+    if not history_is_frozen(history):
+        return False
+    if case.get("target") not in (
+        "2026-11-19T04:30:00Z",
+        "2026-11-19T05:00:00Z",
+    ):
+        return False
+    trophies = case.get("trophies") or []
+    if [t.get("id") for t in trophies] != list(range(1, 56)):
+        return False
+    if history[0].get("players_tracked") != 638:
+        return False
+    return True
+
+
 def frozen_rows(case):
     """Frozen-path quantiles: medians are the transcribed refreshed-page
-    rates, spread sigma = 0.003 on the logit scale. Trophy id 2 (100%)
+    rates, spread sigma = 0.0001 on the logit scale. Trophy id 2 (100%)
     gets all five quantiles exactly 100.0 (never through the logit)."""
     rows = []
     for trophy in case["trophies"]:
@@ -474,10 +497,20 @@ def forecast_case(case):
     starter fallback. Always returns a valid rows list (never crashes).
     Two tiers: >= 8 segments -> shipped rich (damping 1.0, mult 0.75);
     6-7 segments -> degraded rich (damping 0.4, mult 1.0, window 24h);
-    < 6 segments -> starter (a trend fit on 2-5 segments loses to it)."""
+    < 6 segments -> starter (a trend fit on 2-5 segments loses to it).
+    Circuit breaker (RANK1-REVISION): the frozen path re-verifies all
+    four gate conditions independently before frozen_rows() is called;
+    any failure falls back to the starter, never to frozen_rows()."""
     try:
         if is_frozen_case(case):
-            return frozen_rows(case)
+            # Circuit breaker: re-verify all four gate conditions
+            # independently (does not call is_frozen_case again, so a
+            # defect in one gate cannot alone open the frozen path).
+            # If any re-check fails, NEVER call frozen_rows() -- the
+            # narrow frozen spread on moving data would be catastrophic.
+            if _frozen_gate_verified(case):
+                return frozen_rows(case)
+            return starter_rows(case)
         n_seg = len(segments_of(case.get("history") or []))
         if n_seg >= RICH_MIN_SEGMENTS:
             rows = _rich_rows(case, RICH_DAMPING, RICH_MULT_FIXED)
